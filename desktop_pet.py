@@ -44,6 +44,8 @@ except ImportError as e:
 
 from ui.pet_responses import random_window_close_line
 from ui.pet_settings import MESSAGE_FREQUENCY_PRESETS, PetSettingsDialog
+from ui.pet_library_dialog import ChangePetDialog
+from core.pet_library import get_pet
 
 # Global click detection (optional — pet just won't react to same-page clicks
 # if pynput isn't installed).
@@ -55,7 +57,7 @@ except ImportError as e:
 
 # Minimum gap between click-triggered reactions (separate from the
 # window-switch trigger, which now bypasses the brain's cooldown entirely).
-CLICK_REACT_COOLDOWN = 20.0
+CLICK_REACT_COOLDOWN = 12.0
 
 # Global keystroke listener (optional, OPT-IN — see keystroke_monitor.py for
 # the privacy contract: nothing is ever captured unless the
@@ -70,9 +72,9 @@ except ImportError as e:
 # Keystroke-commentary pacing: needs a decent chunk of fresh typing, then
 # only "sometimes" (not every eligible moment) reacts, then a longer cooldown
 # so it's an occasional aside, not a running commentary.
-KEYSTROKE_REACT_COOLDOWN = 45.0
-KEYSTROKE_MIN_CHARS = 24
-KEYSTROKE_REACT_PROB = 0.35
+KEYSTROKE_REACT_COOLDOWN = 25.0
+KEYSTROKE_MIN_CHARS = 16
+KEYSTROKE_REACT_PROB = 0.55
 
 # Best-effort skip list: never forward typed text to the LLM while the
 # active app/window looks like it might involve sensitive input. Not
@@ -149,6 +151,12 @@ class DesktopPet:
         default_config = {
             "name": "Pip",
             "color": "#C9A5F0",
+            # Which core.pet_library.PET_LIBRARY entry is active. Selecting
+            # a different pet via the right-click "Change Pet…" dialog
+            # updates this plus "color"/"pattern" together; shape, rig, and
+            # every animation are identical across all pets.
+            "pet_species": "pip",
+            "pattern": "plain",
             "personality_traits": [],
             "initial_prompt": "",
             "move_frequency": "normal",
@@ -160,6 +168,14 @@ class DesktopPet:
             # occasionally passed to the LLM for a one-off reaction, never
             # written to disk/logged, and cleared immediately after use.
             "keystroke_commentary": False,
+            # LLM backend selection. "ollama" (default) runs fully local and
+            # needs no key. The others are opt-in hosted alternatives (see
+            # core/llm_providers.py) — set an API key in Settings to use
+            # them. llm_model_override lets a user pin a specific model id;
+            # blank uses each provider's sane default.
+            "llm_provider": "ollama",
+            "llm_api_key": "",
+            "llm_model_override": "",
             # The full LLM system prompt (pet_brain.SYSTEM_PROMPT by
             # default). Deliberately editable here and ONLY here — NOT
             # exposed in the Settings dialog UI — so it's a config-file-only
@@ -205,6 +221,11 @@ class DesktopPet:
                 self.config.get("personality_traits", []),
                 self.config.get("initial_prompt", ""))
             self.brain.set_system_prompt(self.config.get("system_prompt", ""))
+            self.brain.set_provider(
+                self.config.get("llm_provider", "ollama"),
+                api_key=self.config.get("llm_api_key") or None,
+                model_override=self.config.get("llm_model_override") or None,
+            )
         if self.keystroke_monitor:
             self.keystroke_monitor.set_enabled(
                 bool(self.config.get("keystroke_commentary", False)))
@@ -228,6 +249,18 @@ class DesktopPet:
                 self.engine.save_state(immediate=True)
                 
             self.apply_runtime_settings()
+
+    def open_change_pet(self):
+        dialog = ChangePetDialog(self.config.get("pet_species", "pip"), parent=self.window)
+        if dialog.exec():
+            species = get_pet(dialog.selected_id)
+            self.config["pet_species"] = species["id"]
+            self.config["color"] = species["color"]
+            self.config["pattern"] = species["pattern"]
+            self.save_config()
+            self.apply_runtime_settings()
+            if self.window:
+                self.window.show_bubble(f"Ta-da, I'm {species['name']} now!", duration_ms=2200)
 
     def _on_pet_clicked(self, interaction_type):
         if self.engine:
@@ -263,7 +296,11 @@ class DesktopPet:
         # 2. Check behavior gating
         gating = self.engine.get_behavior_gating(event)
         if not gating["allowSpeech"]:
-            print(f"[gating] Speech blocked: {gating['reason']}")
+            print(
+                f"[gating] Speech blocked: {gating['reason']} "
+                f"(event={event.type} source='{event.source}' topic='{event.topic}' "
+                f"summary='{event.summary}')"
+            )
             return
 
         def task():
@@ -362,14 +399,20 @@ class DesktopPet:
 
         gating = self.engine.get_behavior_gating(event)
         if not gating["allowSpeech"]:
+            print(f"[gating] Typing commentary blocked: {gating['reason']}")
             return
 
         now = time.time()
-        if (now - self._last_keystroke_reaction) < KEYSTROKE_REACT_COOLDOWN:
+        remaining_cooldown = KEYSTROKE_REACT_COOLDOWN - (now - self._last_keystroke_reaction)
+        if remaining_cooldown > 0:
+            print(f"[gating] Typing commentary blocked: keystroke_cooldown_{int(remaining_cooldown)}s")
             return
-        if km.buffered_length() < KEYSTROKE_MIN_CHARS:
+        buffered = km.buffered_length()
+        if buffered < KEYSTROKE_MIN_CHARS:
+            print(f"[gating] Typing commentary blocked: buffer_too_short_{buffered}/{KEYSTROKE_MIN_CHARS}chars")
             return
         if random.random() > KEYSTROKE_REACT_PROB:
+            print("[gating] Typing commentary blocked: probability_roll")
             return  # eligible, but only "sometimes" actually reacts
 
         title = (activity.get("window_title") or "").lower()
@@ -439,6 +482,11 @@ class DesktopPet:
     def _trigger_idle_comment(self):
         from core.pet_engine import Event
         event = Event("idle_comment", "system", "Periodic idle comment")
+        # Idle comments are periodic/ambient by design, not tied to an
+        # activity change, so they're exempt from meaningful-change gating
+        # (unlike application/window events, which go through
+        # engine.register_event() and earn this flag via the detector).
+        event.isMeaningfulChange = True
         gating = self.engine.get_behavior_gating(event)
         if not gating["allowSpeech"]:
             print(f"[gating] Idle speech blocked: {gating['reason']}")
@@ -547,6 +595,7 @@ class DesktopPet:
 
         self.window = DesktopPetWindow()
         self.window.settings_requested.connect(self.open_settings)
+        self.window.change_pet_requested.connect(self.open_change_pet)
         self.window.quit_requested.connect(self.stop)
         self.window.pet_clicked.connect(self._on_pet_clicked)
         self.apply_runtime_settings()
@@ -655,13 +704,14 @@ class DesktopPet:
                             "Disk Space Warning",
                             "Your home directory might have insufficient disk space. Attempting download anyway."
                         )
-                    
+
                     dlg = AIDownloadDialog(model_manager, model_name, self.window)
                     if dlg.exec() != QDialog.Accepted:
                         # Cancelled/failed -> set resolved mode to engine_only
                         with self.engine.lock:
                             self.engine.state["performance"]["resolvedMode"] = "engine_only"
                         self.engine.save_state(immediate=True)
+                        return
                 else:
                     # Declined -> set resolved mode to engine_only
                     with self.engine.lock:
@@ -672,6 +722,50 @@ class DesktopPet:
                         "Engine-Only Mode",
                         "Pip will run in Engine-only mode. You can download models and change performance tiers in Settings at any time."
                     )
+                    return
+
+            # Model is installed (was already present, or just downloaded) —
+            # verify it can actually deliver a response within the latency
+            # budget before committing to this tier. A "faster" machine's
+            # static hardware specs (RAM/VRAM) can recommend a big model that
+            # still cold-loads for 30-100+s in practice; don't let that
+            # silently become the active tier unverified.
+            self._benchmark_and_enforce_budget(rec, model_name)
+
+    def _benchmark_and_enforce_budget(self, tier, model_name):
+        """Run a quick benchmark against `model_name` and step the active
+        tier down if it can't meet the response-latency budget — same
+        enforcement as the Settings "Run Diagnostic" button, applied
+        automatically right after a tier is first activated/downloaded."""
+        from core.pet_performance import BenchmarkService, step_down_tier, DEFAULT_LATENCY_BUDGET_S
+        from ui.pet_settings import BenchmarkDialog
+
+        bench_service = BenchmarkService(self.ollama_client)
+        dlg = BenchmarkDialog(bench_service, model_name, self.window)
+        if dlg.exec() != QDialog.Accepted or not dlg.result:
+            return  # cancelled/failed to run — leave the tier as-is
+
+        res = dlg.result
+        with self.engine.lock:
+            perf = self.engine.state["performance"]
+            perf.setdefault("benchmarkResults", {})[tier] = res
+            perf["benchmarkTimestamp"] = datetime.now().isoformat()
+
+            if res.get("classification") == "failed" and tier != "engine_only":
+                lower = step_down_tier(tier)
+                perf["selectedMode"] = lower
+                perf["resolvedMode"] = lower
+                budget = res.get("latency_budget_s", DEFAULT_LATENCY_BUDGET_S)
+                QMessageBox.warning(
+                    self.window,
+                    "Performance Tier Automatically Downgraded",
+                    f"'{tier.upper()}' can't reliably respond within the {budget:.0f}s "
+                    f"budget (cold load: {res.get('cold_load_time', 0.0):.1f}s, warm "
+                    f"latency: {res.get('warm_latency', 0.0):.2f}s).\n\n"
+                    f"Automatically stepped down to '{lower.upper()}'. You can change "
+                    "this any time in Settings."
+                )
+        self.engine.save_state(immediate=True)
 
     def _check_runtime_adaptation(self):
         """Runs periodic system load checks and adapts performance tier under resource pressure."""

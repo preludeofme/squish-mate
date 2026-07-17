@@ -11,7 +11,6 @@ Generates structured JSON responses:
 Runs all HTTP calls in background threads.
 """
 
-import os
 import re
 import time
 import json
@@ -24,14 +23,10 @@ try:
 except ImportError:
     requests = None
 
+from core import llm_providers
+
 MODEL_NAME = "gemma4:e4b"
 OLLAMA_URL = "http://localhost:11434"
-DEBUG = os.environ.get("PET_BRAIN_DEBUG", "1") != "0"
-
-
-def _debug(msg):
-    if DEBUG:
-        print(f"[pet_brain] {msg}")
 
 
 SYSTEM_PROMPT = """You are Pip, a tiny silly squishy lavender alien blob pet living on the user's computer.
@@ -41,7 +36,9 @@ Your job: output a JSON object containing your reaction, current emotion, and ph
 Vibe: curious, goofy, mischievous, encourage the user. Keep comment short and natural.
 
 Rules:
-- Text reaction must be under 14 words. Never start two comments in a row with the same word.
+- Text reaction should be 20-30 words — a full sentence or two of genuine
+  personality, not just a short blurt. Never start two comments in a row
+  with the same word.
 - Never use creepy surveillance language (e.g. "I'm watching you").
 - Never quote exact text from the user's screen.
 - Suggested emotion must be one of: neutral, happy, curious, surprised, concerned, annoyed, hurt, sleepy, excited, content.
@@ -52,7 +49,7 @@ FORMAT_INSTRUCTION = """
 
 CRITICAL: You MUST respond ONLY with a JSON object in this exact format. Do not write any markdown code blocks, quotes, or preamble:
 {
-  "text": "<your comment, max 14 words>",
+  "text": "<your comment, 20-30 words>",
   "suggestedEmotion": "<neutral|happy|curious|surprised|concerned|annoyed|hurt|sleepy|excited|content>",
   "suggestedAction": "<idle|wobble|peek|wave|hop|bounce|screen_traversal|excited|yawn|stretch|dance|somersault|eat|sleep>"
 }"""
@@ -82,7 +79,9 @@ def _sanitize(text, limit=160):
 
 class PetBrain:
     def __init__(self, model=MODEL_NAME, memory=None, ollama_url=OLLAMA_URL,
-                 cooldown=30.0, timeout=25.0, system_prompt=None, engine=None):
+                 cooldown=30.0, timeout=45.0, system_prompt=None, engine=None,
+                 provider="ollama", api_key=None, model_override=None,
+                 base_url=None):
         self._model = model
         self.memory = memory
         self.url = ollama_url.rstrip("/")
@@ -94,9 +93,27 @@ class PetBrain:
         self._persona_extra = ""
         self._base_system_prompt = (system_prompt or "").strip() or SYSTEM_PROMPT
         self._recent_lines = deque(maxlen=6)
+        # Hosted-provider support (see core/llm_providers.py). 'ollama'
+        # (the default) is handled entirely by the existing _chat() flow
+        # below and never touches this module. Any other provider requires
+        # an API key, set via set_provider()/Settings.
+        self.provider = (provider or "ollama").strip().lower()
+        self.api_key = api_key or None
+        self._model_override = (model_override or "").strip()
+        self.base_url = base_url or None
+
+    def set_provider(self, provider, api_key=None, model_override=None, base_url=None):
+        """Live-swap the LLM backend (e.g. from the Settings dialog)."""
+        self.provider = (provider or "ollama").strip().lower()
+        self.api_key = api_key or None
+        self._model_override = (model_override or "").strip()
+        self.base_url = base_url or None
 
     @property
     def model(self):
+        if self.provider != "ollama":
+            return self._model_override or llm_providers.DEFAULT_MODELS.get(
+                self.provider, self._model)
         if self.engine and hasattr(self.engine, "state") and self.engine.state:
             perf = self.engine.state.get("performance", {})
             resolved = perf.get("resolvedMode", "low")
@@ -121,6 +138,20 @@ class PetBrain:
             if cfg:
                 return cfg.get("options", {}), cfg.get("keepAlive", "2m")
         return {}, "5m"
+
+    def _effective_timeout(self):
+        """Response-time budget for a single call. Prefers the engine's
+        `llmTimeout` config (user/settings-controlled, also what
+        `BenchmarkService` uses to classify performance tiers) over the
+        constructor default, so runtime enforcement and tier selection agree
+        on what "fast enough" means. A bigger/better model never gets to
+        block a response past this budget — it fails fast to a fallback
+        line instead."""
+        if self.engine and getattr(self.engine, "config", None):
+            budget = self.engine.config.get("llmTimeout")
+            if budget:
+                return budget
+        return self.timeout
 
 
     def set_persona(self, traits=None, initial_prompt=""):
@@ -162,12 +193,23 @@ class PetBrain:
     def _chat(self, system, user, num_predict=200, temperature=0.75,
               image_b64=None, max_retries=1, log_prompt=True):
         if self.model == "engine_only":
+            print("[pet_brain] _chat: skipped — model set to 'engine_only'")
             return None
         if requests is None:
+            print("[pet_brain] _chat: skipped — 'requests' package not available")
             return None
-        
+
+        if self.provider != "ollama":
+            return self._chat_hosted(system, user, num_predict, temperature, image_b64)
+
+        effective_timeout = self._effective_timeout()
         for attempt in range(max_retries + 1):
             try:
+                print(
+                    f"[pet_brain] _chat: calling Ollama model='{self.model}' "
+                    f"(attempt {attempt + 1}/{max_retries + 1}, num_predict={num_predict}, "
+                    f"timeout={effective_timeout}s) user='{user[:120]}'"
+                )
                 user_message = {"role": "user", "content": user}
                 if image_b64:
                     allowed_vision = True
@@ -209,23 +251,66 @@ class PetBrain:
                         ],
                         "stream": False,
                         "keep_alive": keep_alive,
+                        # Some models (e.g. gemma4) emit hidden reasoning in a
+                        # separate "thinking" field before the actual reply.
+                        # Without disabling it, num_predict can be exhausted
+                        # entirely on that reasoning trace, leaving an empty
+                        # "content" and forcing a fallback line every time.
+                        "think": False,
                         "options": req_options,
                     },
-                    timeout=self.timeout,
+                    timeout=effective_timeout,
                 )
                 r.raise_for_status()
                 data = r.json()
                 content = (data.get("message") or {}).get("content", "")
                 if content:
+                    print(f"[pet_brain] _chat: received {len(content)} chars: {content[:200]!r}")
                     return content
+                print(
+                    f"[pet_brain] _chat: empty content in response "
+                    f"(done_reason={data.get('done_reason')!r}) — model likely spent its "
+                    f"num_predict budget without producing output"
+                )
             except Exception as e:
-                _debug(f"_chat: ollama call FAILED: {e}")
+                print(f"[pet_brain] _chat: ollama call FAILED: {e}")
                 return None
+        return None
+
+    def _chat_hosted(self, system, user, num_predict, temperature, image_b64):
+        """Route a chat call through a hosted provider (see
+        core/llm_providers.py) instead of local Ollama. Mirrors the same
+        contract as the Ollama path above: returns text content or None on
+        any failure, and PetBrain callers already treat None as
+        'use a SAFE_FALLBACKS line'."""
+        effective_timeout = self._effective_timeout()
+        print(
+            f"[pet_brain] _chat: calling {self.provider} model='{self.model}' "
+            f"(num_predict={num_predict}, timeout={effective_timeout}s) "
+            f"user='{user[:120]}'"
+        )
+        try:
+            content = llm_providers.chat(
+                self.provider, model=self.model, system=system, user=user,
+                api_key=self.api_key, base_url=self.base_url,
+                num_predict=num_predict, temperature=temperature,
+                image_b64=image_b64, timeout=effective_timeout,
+            )
+        except llm_providers.ProviderError as e:
+            print(f"[pet_brain] _chat: {self.provider} call FAILED: {e}")
+            return None
+        if content:
+            print(f"[pet_brain] _chat: received {len(content)} chars from "
+                  f"{self.provider}: {content[:200]!r}")
+            return content
+        print(f"[pet_brain] _chat: empty content from {self.provider}")
         return None
 
     def available(self):
         if self.model == "engine_only":
             return False
+        if self.provider != "ollama":
+            return bool(self.api_key)
         if requests is None:
             return False
         try:
@@ -241,6 +326,7 @@ class PetBrain:
     def think(self, context, force=False, screenshot_b64=None):
         with self._lock:
             if not force and self._cooling_down():
+                print(f"[pet_brain] think: skipped — brain cooldown active ({self.cooldown}s)")
                 return None
             self._last_call = time.time()
 
@@ -285,40 +371,47 @@ class PetBrain:
 
         if not validated:
             fallback = random.choice(SAFE_FALLBACKS)
+            print(f"[pet_brain] think: using SAFE_FALLBACKS (raw={raw!r}) -> {fallback['text']!r}")
             self._remember_line(fallback["text"])
             return fallback
 
+        print(f"[pet_brain] think: using LLM response -> {validated['text']!r}")
         self._remember_line(validated["text"])
         return validated
 
     def idle_comment(self, force=False):
         with self._lock:
             if not force and self._cooling_down():
+                print(f"[pet_brain] idle_comment: skipped — brain cooldown active ({self.cooldown}s)")
                 return None
             self._last_call = time.time()
-            
+
         topic = random.choice([
             "a random silly thought",
             "observation about your squishy blob body",
             "wanting attention or feeling bored",
         ])
-        
+
         raw = self._chat(
             self._system_prompt(),
             f"User is idle. Output a structured JSON reaction about: {topic}."
             f"{self._recent_lines_note()}",
             num_predict=150,
         )
-        
+
         validated = None
         if raw and self.engine:
             validated = self.engine.validate_llm_response(raw)
+            if not validated:
+                print(f"[pet_brain] idle_comment: LLM raw response failed validation: {raw!r}")
 
         if not validated:
             fallback = random.choice(SAFE_FALLBACKS)
+            print(f"[pet_brain] idle_comment: using SAFE_FALLBACKS -> {fallback['text']!r}")
             self._remember_line(fallback["text"])
             return fallback
 
+        print(f"[pet_brain] idle_comment: using LLM response -> {validated['text']!r}")
         self._remember_line(validated["text"])
         return validated
 
@@ -328,6 +421,7 @@ class PetBrain:
             return None
         with self._lock:
             if not force and self._cooling_down():
+                print(f"[pet_brain] comment_on_typing: skipped — brain cooldown active ({self.cooldown}s)")
                 return None
             self._last_call = time.time()
 
@@ -338,16 +432,20 @@ class PetBrain:
             f"{self._recent_lines_note()}"
         )
         raw = self._chat(self._system_prompt(), user_msg, num_predict=150, log_prompt=False)
-        
+
         validated = None
         if raw and self.engine:
             validated = self.engine.validate_llm_response(raw)
+            if not validated:
+                print(f"[pet_brain] comment_on_typing: LLM raw response failed validation: {raw!r}")
 
         if not validated:
             fallback = random.choice(SAFE_FALLBACKS)
+            print(f"[pet_brain] comment_on_typing: using SAFE_FALLBACKS -> {fallback['text']!r}")
             self._remember_line(fallback["text"])
             return fallback
 
+        print(f"[pet_brain] comment_on_typing: using LLM response -> {validated['text']!r}")
         self._remember_line(validated["text"])
         return validated
 

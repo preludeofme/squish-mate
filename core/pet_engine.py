@@ -85,8 +85,8 @@ DEFAULT_CONFIG = {
     "maximumRecentComments": 20,
     "maximumRecentTopics": 10,
     "nearDuplicateSimilarityThreshold": 0.75,
-    "maximumCommentWords": 14,
-    "maximumCommentCharacters": 120,
+    "maximumCommentWords": 30,
+    "maximumCommentCharacters": 210,
     "llmTimeout": 20.0,
     "llmRetryCount": 1,
     "typingSuppressionDuration": 15.0,
@@ -181,12 +181,19 @@ class MeaningfulChangeDetector:
                 return True
             return False
 
-        # Application changes
+        # Application changes — compare actual app/process identity, not the
+        # topic bucket. Two different apps (e.g. a terminal and a browser)
+        # can both map to the same topic (e.g. "general"), and that must
+        # still count as a meaningful switch.
         if event.type == "application_changed":
-            if event.topic != self.last_app:
-                self.last_app = event.topic
+            if event.source != self.last_app:
+                self.last_app = event.source
                 event.isMeaningfulChange = True
                 return True
+            logger.info(
+                f"Not meaningful: application_changed source='{event.source}' "
+                f"topic='{event.topic}' unchanged from last app '{self.last_app}'"
+            )
             return False
 
         # Window title changes
@@ -197,25 +204,44 @@ class MeaningfulChangeDetector:
                 self.last_title = event.summary
                 event.isMeaningfulChange = True
                 return True
-            
+
             words_prev = set(self.last_title.lower().split())
             words_new = set(event.summary.lower().split())
             if not words_prev or not words_new:
+                logger.info(
+                    f"Not meaningful: window_title_changed has empty title(s) "
+                    f"prev='{self.last_title}' new='{event.summary}'"
+                )
                 return False
-            
+
             # If word overlap is low, it's a meaningful document/context shift
             jaccard = len(words_prev.intersection(words_new)) / len(words_prev.union(words_new))
             if jaccard < 0.4:  # less than 40% words matching
                 self.last_title = event.summary
                 event.isMeaningfulChange = True
                 return True
+            logger.info(
+                f"Not meaningful: window_title_changed jaccard={jaccard:.2f} (>= 0.4 threshold) "
+                f"prev='{self.last_title}' new='{event.summary}'"
+            )
             return False
+
+        # Clicks — the caller (ClickMonitor via desktop_pet.py) already rate
+        # limits how often click activity gets reported at all, so every
+        # click event that reaches here is inherently meaningful.
+        if event.type == "click_activity":
+            event.isMeaningfulChange = True
+            return True
 
         # Milestones or pet states
         if event.type in ("pet_sleep", "pet_wake", "relationship_milestone", "growth_milestone"):
             event.isMeaningfulChange = True
             return True
 
+        logger.info(
+            f"Not meaningful: unhandled event type='{event.type}' source='{event.source}' "
+            f"topic='{event.topic}' summary='{event.summary}'"
+        )
         return False
 
     def guess_topic(self, active_app, window_title):
@@ -781,8 +807,13 @@ class PetEngine:
                 return gating
 
             # Check if typing is active (suppress comment if typed within 15 seconds)
-            # Direct interactions and typing events are exempt from typing suppression
-            if not event.isDirectInteraction and event.type not in ("typing_started", "typing_continued"):
+            # Direct interactions, typing events, real app switches, and clicks
+            # are exempt — each of those is itself a deliberate break from
+            # whatever typing was happening, so there's nothing left to
+            # "interrupt".
+            if not event.isDirectInteraction and event.type not in (
+                "typing_started", "typing_continued", "application_changed", "click_activity"
+            ):
                 last_typing_str = self.state["behavior"].get("lastTypingAt")
                 if last_typing_str:
                     try:
@@ -823,22 +854,46 @@ class PetEngine:
                 except ValueError:
                     pass
 
-            # 2. Topic/Application Cooldowns
+            # 2. Topic/Application Cooldowns (time-based — only suppress if
+            # this topic/app was spoken about *recently*, not merely because
+            # it appears somewhere in a small rolling window. A fixed-size
+            # membership check falsely blocks near-permanently for users
+            # whose activity only spans a couple of distinct topics/apps.)
             history = self.state["recentHistory"]
-            
+
             # Check topic cooldown
-            recent_topics = history.get("topics", [])
-            if event.topic in recent_topics[-self.config["maximumRecentTopics"]:]:
-                gating["allowSpeech"] = False
-                gating["reason"] = f"topic_cooldown_{event.topic}"
-                return gating
+            for entry in reversed(history.get("topics", [])):
+                if not isinstance(entry, dict) or entry.get("topic") != event.topic:
+                    continue
+                ts = entry.get("timestamp")
+                if not ts:
+                    break
+                try:
+                    elapsed = (now - datetime.fromisoformat(ts)).total_seconds()
+                except ValueError:
+                    break
+                if elapsed < self.config["sameTopicCooldown"]:
+                    gating["allowSpeech"] = False
+                    gating["reason"] = f"topic_cooldown_{event.topic}_{int(self.config['sameTopicCooldown'] - elapsed)}s"
+                    return gating
+                break  # only the most recent occurrence of this topic matters
 
             # Check application cooldown
-            recent_apps = [e.get("app") for e in history.get("comments", []) if e.get("app")]
-            if event.source in recent_apps[-3:]:
-                gating["allowSpeech"] = False
-                gating["reason"] = f"application_cooldown_{event.source}"
-                return gating
+            for entry in reversed(history.get("comments", [])):
+                if entry.get("app") != event.source:
+                    continue
+                ts = entry.get("timestamp")
+                if not ts:
+                    break
+                try:
+                    elapsed = (now - datetime.fromisoformat(ts)).total_seconds()
+                except ValueError:
+                    break
+                if elapsed < self.config["sameApplicationCooldown"]:
+                    gating["allowSpeech"] = False
+                    gating["reason"] = f"application_cooldown_{event.source}_{int(self.config['sameApplicationCooldown'] - elapsed)}s"
+                    return gating
+                break  # only the most recent occurrence of this app matters
 
             # Low energy speech suppression
             energy = self.state["energy"]["current"]
@@ -887,13 +942,21 @@ class PetEngine:
                 weights.append(w)
 
             selected_action = random.choices([a[0] for a in allowed], weights=weights, k=1)[0]
-            
-            # Deduct action energy
-            cost = ACTION_METADATA[selected_action]["cost"]
-            self.state["energy"]["current"] = max(0.0, self.state["energy"]["current"] - cost)
+
+            if selected_action == "eat":
+                # Eating restores energy rather than costing it.
+                gain = 25.0
+                self.state["energy"]["current"] = min(
+                    self.config["energyMaximum"], self.state["energy"]["current"] + gain
+                )
+                logger.info(f"Selected action 'eat' (Energy gained: {gain}, Energy remaining: {self.state['energy']['current']:.2f})")
+            else:
+                # Deduct action energy
+                cost = ACTION_METADATA[selected_action]["cost"]
+                self.state["energy"]["current"] = max(0.0, self.state["energy"]["current"] - cost)
+                logger.info(f"Selected action '{selected_action}' (Cost: {cost}, Energy remaining: {self.state['energy']['current']:.2f})")
+
             self.state["behavior"]["lastMovementAt"] = datetime.now().isoformat()
-            
-            logger.info(f"Selected action '{selected_action}' (Cost: {cost}, Energy remaining: {self.state['energy']['current']:.2f})")
             self._save_state_locked()
             return selected_action
 
@@ -1115,14 +1178,17 @@ class PetEngine:
             if has_question:
                 last_speech = self.state["behavior"]["lastSpeechAt"]
                 now = datetime.now()
-                # Enforce question cooldown
+                # Enforce question cooldown — but only defuse the question
+                # mark rather than discarding the whole (otherwise good and
+                # unique) LLM comment. Throwing away the entire response
+                # here was forcing a canned SAFE_FALLBACKS line any time the
+                # LLM phrased its reaction as a question, which is common.
                 if last_speech:
                     try:
                         elapsed = (now - datetime.fromisoformat(last_speech)).total_seconds()
                         if elapsed < self.config["questionCooldown"]:
-                            # Suppress question by removing the query or falling back
-                            logger.info("Question budget exhausted, suppressing LLM question.")
-                            return None
+                            logger.info("Question budget exhausted, converting LLM question to a statement.")
+                            text = text.replace("?", ".").strip()
                     except ValueError:
                         pass
 
@@ -1148,7 +1214,10 @@ class PetEngine:
                     comments.pop(0)
 
                 topics = self.state["recentHistory"]["topics"]
-                topics.append(self.state["behavior"]["currentTopic"])
+                topics.append({
+                    "topic": self.state["behavior"]["currentTopic"],
+                    "timestamp": datetime.now().isoformat(),
+                })
                 if len(topics) > self.config["maximumRecentTopics"]:
                     topics.pop(0)
 

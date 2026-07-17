@@ -306,6 +306,212 @@ Settings dialog).
   base text while still layering the existing persona traits/initial
   prompt underneath.
 
+## Chattiness debugging session — gating engine bugs + performance tier fix (2026-07-17)
+Ryan: pet barely talks, typing/click reactions never fire, and what little it
+says looks canned/fallback. Codebase has since gained a full `core/pet_engine.py`
+(`PetEngine`, `MeaningfulChangeDetector`, `get_behavior_gating`) that supersedes
+the simpler cooldown notes above — this section documents that newer system.
+Found and fixed a chain of real bugs, not just tuning:
+- **`pynput` was never installed** in `.venv` — click/keystroke monitors were
+  silently fully disabled the whole time regardless of config. Installed it;
+  fixed `run_pet.sh`'s install-hint (was missing `pynput`, README/USAGE.md
+  already had it correctly).
+- **`_trigger_idle_comment()` built a raw `Event()` directly instead of going
+  through `engine.register_event()`**, so `isMeaningfulChange` stayed at its
+  `False` default forever → every periodic idle bubble was blocked
+  `not_meaningful`. Fix: idle comments are periodic/ambient by design and are
+  now explicitly marked meaningful before gating.
+- **Topic/application cooldowns (`topic_cooldown_*`/`application_cooldown_*`)
+  were fake** — `get_behavior_gating` checked *membership in a small
+  fixed-size rolling window* (last 10 topics / last 3 apps spoken about),
+  not elapsed time, even though `sameTopicCooldown`/`sameApplicationCooldown`
+  config values already existed (300s) and were dead/unused. For anyone whose
+  activity spans only 1-3 topics (extremely common: "general" + "coding"),
+  this was a near-permanent lock, not a cooldown. Rewired both to use real
+  elapsed-time checks against those existing config values; `history["topics"]`
+  entries are now `{"topic": ..., "timestamp": ...}` dicts (was bare strings —
+  gating code defensively handles old-format string entries in existing state
+  files).
+- **`MeaningfulChangeDetector.is_meaningful()` compared `event.topic`
+  (category bucket) instead of `event.source` (actual app/process) for
+  `application_changed` events** — switching between two different apps that
+  happen to guess to the same topic (e.g. a terminal and an editor both
+  bucketing to "general") was treated as *no change at all*. This was the
+  literal cause of a real transcript: `python` → `antigravity` both stayed
+  silent. Fixed to compare `event.source`.
+- **`click_activity` events were entirely unhandled** in `is_meaningful()`
+  (fell through to the catch-all `return False`) — click reactions could
+  never fire even after `pynput` was installed and `typing_suppression` was
+  fixed. Now explicitly meaningful (rate-limited elsewhere by
+  `CLICK_REACT_COOLDOWN` + the topic/app cooldowns).
+- **`typing_suppression` blocked `application_changed`/`click_activity`
+  events too** — a real app switch or a click IS itself a deliberate break
+  from typing, so both are now exempt (only truly passive events like
+  periodic `idle_comment` still get suppressed while actively typing).
+- **Typing-commentary gating/cooldown/probability rejections were silent** —
+  `_maybe_react_to_keystrokes()` just `return`ed with zero console output on
+  every rejection path, making it impossible to tell why it wasn't firing.
+  Added `[gating] Typing commentary blocked: <reason>` for all four paths
+  (engine gating, its own cooldown, buffer-too-short, probability roll).
+  Also loosened pacing: cooldown 45s→25s, min buffered chars 24→16, react
+  probability 0.35→0.55. `CLICK_REACT_COOLDOWN` 20s→12s. `message_frequency`
+  in `pet_config.json` bumped `normal`→`chatty`.
+- **`validate_llm_response()` discarded the ENTIRE comment if it contained a
+  `?`** and less than `questionCooldown` (600s) had passed since the last
+  comment — not just the question, the whole otherwise-good LLM line, forcing
+  a `SAFE_FALLBACKS` line instead. Since the system prompt explicitly
+  encourages varying reply shape *including questions*, this was very likely
+  the single biggest cause of the "canned/fallback" feel. Fixed to strip the
+  `?` into a statement instead of discarding the response.
+- **Reasoning-model "thinking" tokens ate the entire `num_predict` budget**
+  (`gemma4:e4b` et al. emit a separate hidden `"thinking"` field before the
+  real reply) — with a 150-token cap, some calls never got past the thinking
+  phase, leaving `content: ""`, silently falling back. Fixed by adding
+  `"think": false` to every `/api/chat` request in `PetBrain._chat()`.
+- **Full LLM call/response logging added** (`core/pet_brain.py`, always-on,
+  no env var gate anymore — removed the now-dead `PET_BRAIN_DEBUG`/`_debug`
+  helper in favor of plain `print`): every `_chat()` call logs the outgoing
+  request (model/attempt/timeout/num_predict/truncated prompt), the raw
+  response or failure reason, cooldown skips, validation failures, and
+  whether the final bubble used real LLM output vs a fallback line. This is
+  the fastest way to confirm whether a given message was actually
+  LLM-generated — grep the console for `[pet_brain]`.
+- **Performance tier config bug**: `PERFORMANCE_MODES["extreme"]["model"]`
+  pointed at `"gemma4:12b"`, which was **never actually installed** on this
+  Ollama host (only `e2b`/`e4b`/`26b`/`31b`/etc. variants exist) — so
+  `resolvedMode: "extreme"` would have 404'd on every call. Fixed to
+  `"gemma4:26b"` (installed, 17.99GB/25.8B). Empirically tested cold-load
+  latency before committing to a default: `gemma4:26b` cold-loads in **~105s**
+  on this shared multi-model Ollama host (way past PetBrain's timeout) vs
+  `gemma4:e4b` at **~8s** — so despite `recommendedMode` (hardware-spec-only
+  static calculation) saying `"extreme"`, the persisted
+  `selectedMode`/`resolvedMode` were pinned to `"high"` (`gemma4:e4b`,
+  4096 ctx, 5m keep-alive) as the actually-reliable choice on this host.
+  `recommendedMode` was deliberately left as `"extreme"` (still accurate
+  hardware-capability info) — only the *active* selection changed. Also
+  bumped `PetBrain`'s default request `timeout` 25s→45s for cold-load
+  headroom. If Ryan wants true `extreme` quality and is fine with an
+  occasional ~1-2 min first-response after the model's been idle, set
+  Performance Tier → Extreme in Settings; otherwise leave on High.
+- All 24 tests in `tests/` still pass after every fix above; two tests
+  (`test_typing_suppression`, `test_energy_drain_and_costs`) were updated to
+  match intentionally-changed behavior (the exemptions above, and `eat` now
+  restoring energy — see next note).
+- Also: `eat` action (`core/pet_engine.py` `ACTION_METADATA`/`select_action`)
+  now **restores** 25 energy (capped at `energyMaximum`) instead of costing
+  0.5 like every other action — was previously just another drain despite
+  the name.
+- Needs Ryan to restart `desktop_pet.py` to pick any of this up.
+
+## Latency-budget enforcement for performance tiers (2026-07-17, same day)
+Ryan: if he upgrades hardware and bumps to a bigger model, he wants a hard
+guarantee responses still come back fast — never a silent 30s+ (or the
+105s cold-load we measured for `gemma4:26b`) wait just because a tier
+"should" work on paper. Two-layer fix, both new and real (not just tuning):
+
+**1. Runtime enforcement — `PetBrain._effective_timeout()`** (`pet_brain.py`):
+`llmTimeout` in `DEFAULT_CONFIG` (pet_engine.py) was ANOTHER dead config
+value (same pattern as `sameTopicCooldown` earlier) — defined but never
+read. Now `_chat()` uses `engine.config["llmTimeout"]` (falls back to the
+constructor default only if no engine) as the actual per-request
+`requests.post(..., timeout=...)`. This is the hard ceiling: no matter how
+big/slow a selected model is, a single call can never block past this
+budget — it fails fast to `SAFE_FALLBACKS` instead of hanging.
+
+**2. Selection-time enforcement — latency-budget-aware benchmarking**
+(`core/pet_performance.py`):
+- `DEFAULT_LATENCY_BUDGET_S = 20.0` (mirrors `llmTimeout`, both budgets
+  agree on "fast enough"). New `TIER_ORDER`/`step_down_tier()` (dedupes what
+  was a copy-pasted `tiers_order` list in two places in `pet_settings.py`).
+- `BenchmarkService.run_benchmark()` already measured `cold_load_time` but
+  never used it for classification (only warm-latency/tokens-per-sec) — a
+  model could be "excellent" by that measure while still taking 30-100+s to
+  cold-load, which is exactly the failure mode that bit this session (see
+  the "performance tier" note above: `gemma4:26b` measured anywhere from
+  ~26s to ~105s cold load across different runs, depending on OS disk-cache
+  state — highly variable, hence why this MUST be empirically benchmarked
+  per-tier rather than assumed from a single number). Now factors
+  `cold_load_time` into `classification`: exceeds budget → capped at
+  `"marginal"`; exceeds `2×budget` → `"failed"`. Also bumped the initial
+  cold-probe request's own timeout way up (40s→150s) so a slow cold load
+  gets *measured and reported* instead of just raising a bare timeout
+  exception with no diagnostic numbers.
+- **Found and fixed a real bug while testing this**: the benchmark's
+  `valid_json` check did a raw `json.loads(content)`, which fails on
+  markdown-fenced JSON (` ```json {...} ``` `) — something these gemma4
+  models do routinely (confirmed live). This was producing FALSE "failed"
+  classifications purely from formatting, unrelated to speed — verified via
+  a live run: `gemma4:e4b` scored `"failed"` (`valid_json: false`) before
+  the fix, `"excellent"` (`valid_json: true`) after, with identical
+  ~0.6-0.8s warm latency both times. Fixed to use the same lenient
+  `re.search(r'\{.*\}', ...)` extraction `validate_llm_response()` already
+  uses in production, so the benchmark's definition of "valid" matches what
+  the running app actually accepts. Also bumped the benchmark's own
+  `num_predict` 48→96 (was truncating mid-JSON-value at 48, another false
+  "invalid" cause) and tightened its system prompt to explicitly forbid
+  markdown fences.
+- **Auto-downgrade wired into both places a tier gets (re)activated**, not
+  just an advisory warning dialog you could dismiss and forget:
+  - `ui/pet_settings.py` `run_diagnostic_and_benchmark()` (manual "Run
+    Diagnostic" button): `"failed"` now actually steps `selectedMode` down
+    one tier via `step_down_tier()` and updates the combo box, with a
+    dialog showing the real numbers (cold load / warm latency vs budget).
+    `"marginal"` still just warns (usable, but flagged).
+  - `desktop_pet.py` new `_benchmark_and_enforce_budget(tier, model_name)`,
+    called from `_check_first_run_setup()` right after a tier's model is
+    confirmed installed (whether freshly downloaded or already present —
+    previously NEITHER path ever benchmarked anything, first-run just
+    trusted the static hardware-spec recommendation blindly). Same
+    step-down-one-tier-on-"failed" behavior, reuses the existing
+    `BenchmarkDialog` for a consistent progress UI.
+- **Also fixed the actual root config bug this whole investigation started
+  from**: `PERFORMANCE_MODES["extreme"]["model"]` was `"gemma4:12b"`, which
+  was never installed on this Ollama host at all (only `e2b`/`e4b`/`26b`/
+  `31b` variants exist) — every tier's `model` field is now verified to
+  point at something that's actually pullable/installed. `extreme` →
+  `gemma4:26b` (17.99GB, confirmed installed). Settings UI label updated to
+  match ("Extreme (12B..." → "Extreme (26B...").
+- Persisted state (`~/.config/squish-mate/pet_state.json`) left pinned at
+  `selectedMode: "high"` / `resolvedMode: "high"` (the empirically-fast,
+  already-installed `gemma4:e4b`) rather than auto-promoting to `extreme` —
+  `recommendedMode` stays `"extreme"` as informational hardware-capability
+  output only. Ryan can opt into `extreme` via Settings → Run Diagnostic any
+  time; it'll now correctly warn/auto-downgrade if the cold-load budget
+  isn't met on a given day's cache state.
+- All 24 tests still pass. Live-verified end-to-end against the real local
+  Ollama instance (not just unit tests): `gemma4:e4b` → `"excellent"`,
+  `gemma4:26b` cold → `"marginal"` (cold load 26.5s > 20s budget, warm
+  latency fine) — both exactly as intended.
+- Needs Ryan to restart `desktop_pet.py` to pick any of this up.
+
+## Response length bumped 14→20-30 words (2026-07-17, same day)
+Ryan wanted longer, fuller replies. Updated everywhere the old 14/16-word
+cap was encoded (there were 3 separate copies — easy to miss one):
+- `pet_engine.py` `DEFAULT_CONFIG`: `maximumCommentWords` 14→30,
+  `maximumCommentCharacters` 120→210 (the actual truncation safety net —
+  verified a 25-word reply passes through untouched, a runaway 40-word one
+  still gets capped to exactly 30).
+- `pet_brain.py` module `SYSTEM_PROMPT`/`FORMAT_INSTRUCTION` (the built-in
+  fallback prompt, used only if `pet_config.json` has no `system_prompt`).
+- `pet_config.json`'s actual active `system_prompt` (this is the one really
+  driving live behavior, per the "system prompt moved into config" note
+  above) — "Under 16 words, short trailed-off phrase" → "Aim for 20-30
+  words... but still land around 20-30 words most of the time", softened
+  the "one-word blurt" example shape since that's no longer the default.
+- **`PERFORMANCE_MODES` `num_predict` was the real ceiling** (both the
+  display-only `numPredict` key and the actual-request `options.num_predict`
+  — the latter always wins via `req_options.update(mode_opts)` in
+  `_chat()`, so per-call `num_predict` args passed by `think()`/
+  `idle_comment()`/etc. are dead weight whenever an engine+performance
+  state is present). Was 64 (low/medium/high) / 72 (extreme) — nowhere near
+  enough for a 30-word reply + JSON wrapper overhead, would have silently
+  truncated mid-sentence exactly like the earlier "thinking tokens ate the
+  budget" bug. Bumped all 4 tiers to 128 uniformly.
+- Live-verified against the real Ollama instance (not just unit tests):
+  warm replies landed at 17-25 words in ~1-1.5s, no truncation, JSON parsed
+  cleanly every time.
+- All 24 tests still pass. Needs Ryan to restart `desktop_pet.py`.
+
 ## Next ideas (Ryan's stated goals)
 - Two-way chat with the user (input box or click-to-chat).
 - Screen reading: screenshots + vision model to parse desktop details.
@@ -438,3 +644,115 @@ options mostly not wired to behavior").
   the system prompt, `apply_runtime_settings()` is a safe no-op before the
   window exists. Not yet verified visually on the real display (right-click
   → menu → dialog interaction needs Ryan's session).
+
+## TASKS.md pass: pet library, mouse-wiggle tickle, hosted LLM providers (2026-07-17)
+All three open TASKS.md items implemented in one pass. All 24 existing tests
+still pass; verified new code paths offscreen end-to-end (see below), not
+yet on Ryan's real display.
+
+**1. Mouse-wiggle "tickle" interaction.**
+`pet_window.py`: the existing `mouseMoveEvent` hover branch already emitted
+a `pet_clicked("hover")` signal (engine-gating only, no direct animation) —
+added `_track_wiggle(global_x, now)` on top of it: keeps a `deque(maxlen=20)`
+of `(t, x)` samples, counts horizontal direction reversals within the last
+`WIGGLE_WINDOW_S` (0.6s); `WIGGLE_MIN_REVERSALS` (3) + `WIGGLE_MIN_TRAVEL_PX`
+(40px) filters out a merely-resting cursor from an actual rapid wiggle.
+`TICKLE_COOLDOWN_S` (6s) gates re-triggering. On trigger, `_react_to_tickle()`
+shows an instant canned line (new `pet_responses.TICKLE_GIGGLE_LINES`/
+`TICKLE_FLEE_LINES` + `random_tickle_line(fleeing=)`, same "instant canned
+reaction, never route through PetBrain" pattern as drag/window-close) and
+either plays a new `PetAnimator.trigger_giggle()` (new `PetState.GIGGLE`,
+`_pose_giggle`: quick decaying side-to-side jiggle + wide grin, added to the
+"stay put" state tuple in `_update_movement`) or, `TICKLE_FLEE_PROB` (0.35)
+of the time, calls the existing `surprise_and_flee()` instead (giggle pose
+would just be instantly overwritten by it, so skipped in that branch).
+`pet_debug.py` ACTION_BUTTONS gained a "Giggle" button for consistency.
+
+**2. Pet library / "Change Pet…".**
+New `core/pet_library.py`: `PET_LIBRARY` (7 entries: pip/mochi/kelp/ember/
+nocturne/honeydew/coral — id, name, color, pattern, blurb) + `get_pet(id)`
+(unknown id safely falls back to the first entry). Per Ryan's spec ("overall
+shape/style should remain the same... squishy") every entry reuses the
+exact same `BlobRenderer`/`PetAnimator` — only body color (already
+customizable via `apply_color`) and a new light decorative `pattern` differ,
+so "all pets have the same functionality" is true by construction, not by
+separate testing.
+- `blob_renderer.py`: new `apply_pattern(pattern)` (validates against
+  `PATTERNS = ("plain","spots","stripes","stars")`, invalid/missing falls
+  back to "plain") + `_draw_pattern`/`_draw_star`, called from inside
+  `_draw_body`'s existing silhouette-clipped block so decorations never
+  bleed outside the body outline. Spots/stripes reuse `BODY_DARK` at low
+  alpha (same jelly-shading language as existing bubbles/highlight); stars
+  draws small 5-point sparkle shapes.
+- New `ui/pet_library_dialog.py`: `ChangePetDialog(current_id, parent)` —
+  modal grid of color-swatch buttons (name + blurb + ✓ on the current pick),
+  `.selected_id` set on accept. Same cream/lavender-adjacent styling
+  language as the other dialogs (transcript/debug).
+- `pet_window.py`: new `change_pet_requested` signal, "Change Pet…" added to
+  the right-click menu between Settings and Transcript; `apply_settings()`
+  now also calls `renderer.apply_pattern(config.get("pattern","plain"))`.
+- `desktop_pet.py`: new `open_change_pet()` (same lazy dialog-open pattern
+  as `open_settings`) — on accept, looks up the species via `get_pet()`,
+  sets `config["pet_species"]`/`config["color"]`/`config["pattern"]`, saves,
+  calls `apply_runtime_settings()`, shows a "Ta-da, I'm {name} now!" bubble.
+  `default_config` gained `"pet_species": "pip"` / `"pattern": "plain"`.
+  Deliberately does NOT touch the Settings dialog's existing custom color
+  picker — picking a species sets a starting color/pattern, but the user can
+  still fine-tune color further via Settings afterward (pattern is only
+  changed by Change Pet, so it survives a later Settings save).
+
+**3. Hosted LLM provider support (OpenAI/Anthropic/OpenRouter).**
+New `core/llm_providers.py` — deliberately NOT touching the existing,
+tightly-tuned Ollama path in `pet_brain.py` (performance tiers, `keep_alive`,
+`think:false`, vision-preference gating are all Ollama-specific and stay
+exactly as-is). Only covers the three opt-in hosted alternatives:
+- `chat(provider, *, model, system, user, api_key, base_url, num_predict,
+  temperature, image_b64, timeout)` dispatches to `_chat_openai` (also
+  reused for `openrouter`, same request/response shape, different
+  `base_url`) or `_chat_anthropic`. Raises `ProviderError` on any failure
+  (no key, network error, etc.) — same "return None / fall back to
+  SAFE_FALLBACKS" contract PetBrain already has for Ollama failures.
+  `DEFAULT_MODELS` gives each hosted provider a sane default
+  (`gpt-4o-mini` / `claude-3-5-haiku-20241022` /
+  `meta-llama/llama-3.1-8b-instruct`) used when no override is configured.
+  Basic vision passthrough included for parity (OpenAI/OpenRouter:
+  `image_url` data-URI content block; Anthropic: base64 `image` content
+  block) — untested against real hosted APIs (no key available in this
+  session), only unit-verified via a mocked `requests.post`.
+- `pet_brain.py`: `PetBrain.__init__`/`set_provider(provider, api_key=,
+  model_override=, base_url=)` — `self.provider` defaults to `"ollama"` so
+  existing behavior/callers are unaffected unless explicitly switched.
+  `model` property and `available()` both branch on `self.provider != "ollama"`
+  first. `_chat()` branches to a new `_chat_hosted()` at the very top
+  (before any Ollama-specific option-building) when provider isn't Ollama;
+  logging follows the exact same `[pet_brain] _chat: ...` convention as the
+  Ollama path so debugging is consistent regardless of backend.
+- `desktop_pet.py`: `default_config` gained `"llm_provider": "ollama"`,
+  `"llm_api_key": ""`, `"llm_model_override": ""`. `apply_runtime_settings()`
+  calls `brain.set_provider(...)` alongside the existing `set_persona`/
+  `set_system_prompt` calls.
+- `pet_settings.py`: General tab gained an "AI Provider" combo (uses
+  `llm_providers.PROVIDER_LABELS`), a password-masked "API Key" field, an
+  optional "Model override" field, and an explanatory note (Ollama tab below
+  it — the "AI Performance" tier tab — is explicitly noted as Ollama-only).
+  `get_values()["general"]` includes the three new keys so they round-trip
+  through the existing `self.config.update(vals["general"])` /
+  `save_config()` flow with no other plumbing changes needed.
+- Verified offscreen: `llm_providers.chat("openai", ...)` with no key raises
+  `ProviderError` as expected; `PetBrain.set_provider("openai", api_key=...,
+  model_override=...)` correctly changes `.model`/`.available()`, and a
+  mocked `requests.post` round-trips through `PetBrain._chat()` end-to-end
+  returning the mocked content. Not tested against real OpenAI/Anthropic/
+  OpenRouter endpoints (no API keys available in this environment) — worth
+  a live smoke test with Ryan's own key before he relies on it.
+- Also noted, not changed: a full end-to-end `DesktopPet` smoke test
+  (scratch config, not Ryan's real `pet_config.json`) incidentally wrote to
+  the real `~/.config/squish-mate/pet_state.json` (PetEngine's default
+  `STATE_PATH` — the engine autoloads/saves that file regardless of which
+  `pet_config.json` is passed in). No functional harm (self-healing runtime
+  state, same file real usage already writes to), but worth remembering:
+  future test-only `PetEngine()` construction should pass an explicit
+  `state_path=` pointing at a scratch file to avoid touching Ryan's real
+  persisted state.
+- Needs Ryan to restart `desktop_pet.py` to pick any of this up, and to
+  supply a real API key in Settings to actually exercise a hosted provider.

@@ -34,6 +34,7 @@ ACTION_BUTTONS = [
     ("Somersault", "trigger_somersault"),
     ("Eat", "trigger_eat"),
     ("Sleep", "trigger_sleep"),
+    ("Giggle", "trigger_giggle"),
 ]
 
 # (button label, Emotion)

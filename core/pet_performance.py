@@ -50,7 +50,7 @@ PERFORMANCE_MODES = {
         "preferredUnifiedMemoryGb": 0.0,
         "minimumFreeDiskGb": 3.6, # model size (1.6G) + 2GB safety
         "numCtx": 2048,
-        "numPredict": 64,
+        "numPredict": 128,
         "keepAlive": "30s",
         "visionEnabled": False,
         "maximumImageDimension": 0,
@@ -58,7 +58,7 @@ PERFORMANCE_MODES = {
         "supportsCpuFallback": True,
         "options": {
             "num_ctx": 2048,
-            "num_predict": 64,
+            "num_predict": 128,
             "temperature": 0.72,
             "top_k": 40,
             "top_p": 0.9,
@@ -81,7 +81,7 @@ PERFORMANCE_MODES = {
         "preferredUnifiedMemoryGb": 16.0,
         "minimumFreeDiskGb": 4.6, # model size (1.6G) + 3GB safety
         "numCtx": 3072,
-        "numPredict": 64,
+        "numPredict": 128,
         "keepAlive": "2m",
         "visionEnabled": True,
         "maximumImageDimension": 640,
@@ -89,7 +89,7 @@ PERFORMANCE_MODES = {
         "supportsCpuFallback": True,
         "options": {
             "num_ctx": 3072,
-            "num_predict": 64,
+            "num_predict": 128,
             "temperature": 0.74,
             "top_k": 40,
             "top_p": 0.9,
@@ -112,7 +112,7 @@ PERFORMANCE_MODES = {
         "preferredUnifiedMemoryGb": 24.0,
         "minimumFreeDiskGb": 6.8, # model size (2.8G) + 4GB safety
         "numCtx": 4096,
-        "numPredict": 64,
+        "numPredict": 128,
         "keepAlive": "5m",
         "visionEnabled": True,
         "maximumImageDimension": 768,
@@ -120,7 +120,7 @@ PERFORMANCE_MODES = {
         "supportsCpuFallback": True,
         "options": {
             "num_ctx": 4096,
-            "num_predict": 64,
+            "num_predict": 128,
             "temperature": 0.76,
             "top_k": 40,
             "top_p": 0.9,
@@ -132,8 +132,8 @@ PERFORMANCE_MODES = {
     "extreme": {
         "id": "extreme",
         "displayName": "Extreme",
-        "model": "gemma4:12b",
-        "model_family": "gemma-4-12B",
+        "model": "gemma4:26b",
+        "model_family": "gemma-4-26B",
         "accelerationPolicy": "gpu_strongly_preferred",
         "minimumRamGb": 32.0,
         "preferredRamGb": 32.0,
@@ -141,9 +141,9 @@ PERFORMANCE_MODES = {
         "preferredVramGb": 16.0,
         "minimumUnifiedMemoryGb": 24.0,
         "preferredUnifiedMemoryGb": 32.0,
-        "minimumFreeDiskGb": 13.6, # model size (7.6G) + 6GB safety
+        "minimumFreeDiskGb": 24.0, # model size (~18G) + 6GB safety
         "numCtx": 4096,
-        "numPredict": 72,
+        "numPredict": 128,
         "keepAlive": "10m",
         "visionEnabled": True,
         "maximumImageDimension": 960,
@@ -151,7 +151,7 @@ PERFORMANCE_MODES = {
         "supportsCpuFallback": True,
         "options": {
             "num_ctx": 4096,
-            "num_predict": 72,
+            "num_predict": 128,
             "temperature": 0.76,
             "top_k": 40,
             "top_p": 0.9,
@@ -490,12 +490,42 @@ class OllamaClient:
 
 # ------------------------------------------------------------- Benchmark Service
 
+#: Default response-time budget (seconds) a performance tier must meet to be
+#: considered usable. Mirrors `DEFAULT_CONFIG["llmTimeout"]` in pet_engine.py
+#: (the same budget `PetBrain` actually enforces per-request) so benchmark
+#: selection and runtime enforcement agree on what "fast enough" means.
+DEFAULT_LATENCY_BUDGET_S = 20.0
+
+# Order from lightest to heaviest — used to auto-downgrade a tier that fails
+# to meet the latency budget in practice, regardless of what static hardware
+# specs alone would recommend.
+TIER_ORDER = ["engine_only", "low", "medium", "high", "extreme"]
+
+
+def step_down_tier(mode):
+    """Return the next-lighter performance tier, or `mode` unchanged if
+    already at the floor (or not a recognized tier)."""
+    if mode not in TIER_ORDER:
+        return mode
+    idx = TIER_ORDER.index(mode)
+    return TIER_ORDER[max(0, idx - 1)]
+
+
 class BenchmarkService:
     def __init__(self, client):
         self.client = client
 
-    def run_benchmark(self, model_name, progress_callback=None, cancel_event=None):
-        """Runs cold and warm inference benchmarks to classify performance tier."""
+    def run_benchmark(self, model_name, progress_callback=None, cancel_event=None,
+                       latency_budget_s=DEFAULT_LATENCY_BUDGET_S):
+        """Runs cold and warm inference benchmarks to classify performance tier.
+
+        A tier only "passes" if it can realistically deliver a response
+        within `latency_budget_s` — including the worst case (cold load
+        after the model's been idle past its keep-alive window), not just
+        warm-inference throughput. A model that's blazing fast once loaded
+        but takes 30-100+s to cold-load will still make the pet feel frozen
+        on the first message after any idle period.
+        """
         if not self.client.available():
             return {"success": False, "error": "Ollama unavailable"}
 
@@ -504,7 +534,11 @@ class BenchmarkService:
             return {"success": False, "error": "Model not installed"}
 
         prompt = "Context: User is editing code.\n\nReact in JSON format."
-        system_prompt = "You are Pip, a tiny silly desktop pet. Output JSON."
+        system_prompt = (
+            "You are Pip, a tiny silly desktop pet. Respond with ONLY a raw "
+            'JSON object like {"text": "..."} — no markdown code fences, no '
+            "preamble."
+        )
         payload = {
             "model": model_name,
             "messages": [
@@ -512,26 +546,38 @@ class BenchmarkService:
                 {"role": "user", "content": prompt}
             ],
             "stream": False,
+            "think": False,
             "options": {
-                "num_predict": 48,
+                # Generous enough that a short JSON reply won't get cut off
+                # mid-value (a truncated response would otherwise look like
+                # an "invalid JSON" failure that's actually just a token-
+                # budget artifact of the benchmark itself, not a real speed
+                # or capability problem).
+                "num_predict": 96,
                 "temperature": 0.7
             }
         }
 
-        # 1. First (potentially cold) run
+        # 1. First (potentially cold) run — use a generous timeout here (well
+        # beyond the actual latency budget) so a slow cold load is *measured*
+        # and reported precisely rather than just raising a bare timeout
+        # exception with no diagnostic value.
         if progress_callback:
             progress_callback("Running initial inference request...")
-        
+
         swap_start = psutil.swap_memory().used if psutil else 0
         start_time = time.time()
-        
+
         try:
-            r = requests.post(f"{self.client.url}/api/chat", json=payload, timeout=40)
+            r = requests.post(f"{self.client.url}/api/chat", json=payload, timeout=150)
             r.raise_for_status()
             initial_latency = time.time() - start_time
             initial_res = r.json()
         except Exception as e:
-            return {"success": False, "error": f"Initial request failed: {e}"}
+            return {
+                "success": False,
+                "error": f"Initial request failed (likely exceeded the cold-load timeout): {e}",
+            }
 
         if cancel_event and cancel_event.is_set():
             return {"success": False, "error": "Benchmark cancelled by user"}
@@ -564,12 +610,19 @@ class BenchmarkService:
             prompt_tokens_sec = warm_res.get("prompt_eval_count", 0) / prompt_eval_dur
 
         content = warm_res.get("message", {}).get("content", "")
+        # Match the same lenient extraction PetEngine.validate_llm_response
+        # uses in production (models routinely wrap JSON in markdown code
+        # fences) — a raw `json.loads(content)` would falsely flag a
+        # perfectly good, fast response as "invalid" purely due to fencing,
+        # which is a formatting quirk unrelated to speed/capability.
         valid_json = False
-        try:
-            json.loads(content)
-            valid_json = True
-        except Exception:
-            pass
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            try:
+                json.loads(match.group(0))
+                valid_json = True
+            except Exception:
+                pass
 
         # Query offload status from Ollama /api/ps
         offload_ratio = 1.0
@@ -585,7 +638,7 @@ class BenchmarkService:
             if size_vram > 0:
                 backend = "gpu"
 
-        # Classification
+        # Classification (warm-inference speed only, so far)
         classification = "failed"
         if valid_json and not paging_occurred:
             if warm_latency <= 2.5 or gen_tokens_sec >= 8.0:
@@ -595,10 +648,22 @@ class BenchmarkService:
             elif warm_latency <= 10.0 or gen_tokens_sec >= 2.0:
                 classification = "marginal"
 
+        # Now fold in the cold-load budget check. A tier that's "excellent"
+        # warm but takes minutes to cold-load doesn't actually deliver
+        # responses within budget on the first message after any idle
+        # period — cap or fail the classification accordingly instead of
+        # only ever measuring steady-state throughput.
+        cold_load_time = max(0.0, initial_latency - warm_latency)
+        meets_latency_budget = (
+            valid_json and not paging_occurred and cold_load_time <= latency_budget_s
+        )
+        if not meets_latency_budget and classification != "failed":
+            classification = "failed" if cold_load_time > latency_budget_s * 2 else "marginal"
+
         return {
             "success": True,
             "classification": classification,
-            "cold_load_time": max(0.0, initial_latency - warm_latency),
+            "cold_load_time": cold_load_time,
             "warm_latency": warm_latency,
             "gen_tokens_sec": gen_tokens_sec,
             "prompt_tokens_sec": prompt_tokens_sec,
@@ -606,7 +671,9 @@ class BenchmarkService:
             "gpu_offloaded_bytes": gpu_bytes,
             "backend": backend,
             "paging_occurred": paging_occurred,
-            "valid_json": valid_json
+            "valid_json": valid_json,
+            "latency_budget_s": latency_budget_s,
+            "meets_latency_budget": meets_latency_budget,
         }
 
 # ----------------------------------------------------------- Model Download Manager

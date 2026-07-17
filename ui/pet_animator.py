@@ -39,6 +39,7 @@ class PetState(Enum):
     DANCE = auto()
     SOMERSAULT = auto()
     EAT = auto()
+    GIGGLE = auto()
 
 
 # Spontaneous idle "action" states — cycled through at random by
@@ -252,6 +253,12 @@ class PetAnimator:
         if force or self.state is PetState.IDLE:
             self._enter(PetState.SLEEP)
 
+    def trigger_giggle(self, force=False):
+        """Tickled reaction — fired when the user wiggles the cursor over
+        the pet (see DesktopPetWindow._track_wiggle)."""
+        if force or self.state is PetState.IDLE:
+            self._enter(PetState.GIGGLE)
+
     def trigger_wander(self, force=False):
         if force or self.state is PetState.IDLE:
             sx, sy, sw, sh = self.last_screen
@@ -388,7 +395,7 @@ class PetAnimator:
 
     def _update_movement(self, dt):
         if self.state in (PetState.DRAGGED, PetState.SLEEP, PetState.WAVE,
-                          PetState.HOP) or self.state in ACTION_STATES:
+                          PetState.HOP, PetState.GIGGLE) or self.state in ACTION_STATES:
             self._vx *= max(0.0, 1.0 - dt * 6)
             return
         dx = self.target_x - self.x
@@ -491,6 +498,11 @@ class PetAnimator:
             if st > 1.9:
                 self._enter(PetState.IDLE)
 
+        elif self.state is PetState.GIGGLE:
+            self._pose_giggle(st, pose)
+            if st > 1.0:
+                self._enter(PetState.IDLE)
+
     def _pose_yawn(self, st, pose):
         """Big stretchy open-mouth yawn: open, hold, close, with a small
         matching arm stretch and squinty eyes."""
@@ -556,6 +568,22 @@ class PetAnimator:
         pose.food_visual = max(0.0, 1.0 - st / T)
         pose.mouth = 0.6
         pose.blush = 0.8
+
+    def _pose_giggle(self, st, pose):
+        """Tickled squirm: quick side-to-side jiggle with a wide grin, decays
+        out over ~1s. Triggered by mouse-wiggle hover, not the random
+        idle-action scheduler."""
+        beat = st * 15.0
+        decay = math.exp(-st * 2.2)
+        pose.scale_x = 1.0 + math.sin(beat) * 0.09 * decay
+        pose.scale_y = 1.0 - math.sin(beat) * 0.07 * decay
+        pose.offset_y = -abs(math.sin(beat * 0.5)) * 5.0 * decay
+        pose.arm_l = math.sin(beat) * 10.0 * decay
+        pose.arm_r = -math.sin(beat + math.pi) * 10.0 * decay
+        pose.mouth = 1.0
+        pose.mouth_open = 0.3 * decay
+        pose.blush = 1.0
+        pose.eye_open = _clamp(1.0 - 0.3 * decay, 0.6, 1.0)
 
     def _pose_hop(self, st, pose):
         """Squash-and-stretch hop: anticipate → airborne → land → recover."""

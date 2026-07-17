@@ -41,7 +41,9 @@ class BlobRenderer:
     BODY_W = 44.0   # body half-width
     BODY_H = 42.0   # body half-height
 
-    def __init__(self, win_w, win_h, color=DEFAULT_BODY_COLOR):
+    PATTERNS = ("plain", "spots", "stripes", "stars")
+
+    def __init__(self, win_w, win_h, color=DEFAULT_BODY_COLOR, pattern="plain"):
         self.win_w = win_w
         self.win_h = win_h
         self.cx = win_w / 2.0
@@ -49,6 +51,8 @@ class BlobRenderer:
         self._zzz_font = QFont("Sans Serif", 11, QFont.Weight.Bold)
         self.BODY_LIGHT = self.BODY_MID = self.BODY_DARK = self.BODY_EDGE = None
         self.apply_color(color)
+        self.pattern = "plain"
+        self.apply_pattern(pattern)
 
     def apply_color(self, hex_str):
         """Recompute the body gradient tones from a single base hex color."""
@@ -59,6 +63,12 @@ class BlobRenderer:
         self.BODY_LIGHT = color.lighter(132)
         self.BODY_DARK = color.darker(128)
         self.BODY_EDGE = color.darker(158)
+
+    def apply_pattern(self, pattern):
+        """Switch the decorative body pattern (see pet_library.py — this is
+        the only other thing besides color that distinguishes a "species").
+        Shape/rig/animations are always identical regardless of pattern."""
+        self.pattern = pattern if pattern in self.PATTERNS else "plain"
 
     # ------------------------------------------------------------------ paths
     def _body_path(self, pose):
@@ -185,7 +195,54 @@ class BlobRenderer:
         # Soft top-left highlight.
         painter.setBrush(QColor(255, 255, 255, 70))
         painter.drawEllipse(QPointF(-w * 0.34, -h * 0.42), w * 0.30, h * 0.22)
+
+        self._draw_pattern(painter, pose)
         painter.restore()
+
+    def _draw_pattern(self, painter, pose):
+        """Decorative species pattern, clipped to the body silhouette by the
+        caller. Purely cosmetic — never affects shape or animation."""
+        if self.pattern == "plain":
+            return
+        w, h = self.BODY_W, self.BODY_H
+        painter.setPen(Qt.PenStyle.NoPen)
+        shade = QColor(self.BODY_DARK.red(), self.BODY_DARK.green(),
+                       self.BODY_DARK.blue(), 100)
+
+        if self.pattern == "spots":
+            painter.setBrush(shade)
+            for sx, sy, r in ((-w * 0.35, h * 0.15, 4.5), (w * 0.15, h * 0.55, 3.6),
+                              (w * 0.42, -h * 0.05, 3.0), (-w * 0.05, h * 0.75, 3.2),
+                              (-w * 0.50, -h * 0.10, 2.6)):
+                painter.drawEllipse(QPointF(sx, sy), r, r)
+
+        elif self.pattern == "stripes":
+            painter.setBrush(shade)
+            for sy in (-h * 0.35, -h * 0.02, h * 0.32, h * 0.68):
+                painter.drawRoundedRect(QRectF(-w * 1.15, sy, w * 2.3, 5.0), 2.5, 2.5)
+
+        elif self.pattern == "stars":
+            sparkle = QColor(255, 255, 255, 210)
+            for sx, sy, r in ((-w * 0.40, -h * 0.10, 2.4), (w * 0.30, h * 0.30, 2.0),
+                              (w * 0.05, -h * 0.38, 1.8), (-w * 0.10, h * 0.62, 2.0),
+                              (w * 0.48, -h * 0.02, 1.6)):
+                self._draw_star(painter, sx, sy, r, sparkle)
+
+    def _draw_star(self, painter, cx, cy, r, color):
+        path = QPainterPath()
+        for i in range(5):
+            angle = math.pi / 2 + i * (2 * math.pi / 5)
+            outer = QPointF(cx + r * math.cos(angle), cy - r * math.sin(angle))
+            if i == 0:
+                path.moveTo(outer)
+            else:
+                path.lineTo(outer)
+            inner_angle = angle + math.pi / 5
+            path.lineTo(QPointF(cx + r * 0.45 * math.cos(inner_angle),
+                                cy - r * 0.45 * math.sin(inner_angle)))
+        path.closeSubpath()
+        painter.setBrush(color)
+        painter.drawPath(path)
 
     def _draw_face(self, painter, pose):
         eye_y = -8.0

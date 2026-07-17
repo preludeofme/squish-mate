@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.blob_renderer import DEFAULT_BODY_COLOR as DEFAULT_COLOR
+from core.llm_providers import PROVIDER_LABELS
 from core.pet_performance import (
     PERFORMANCE_MODES,
     detect_hardware,
@@ -46,6 +47,9 @@ from core.pet_performance import (
     OllamaClient,
     BenchmarkService,
     ModelManager,
+    TIER_ORDER,
+    step_down_tier,
+    DEFAULT_LATENCY_BUDGET_S,
 )
 
 logger = logging.getLogger("PipSettings")
@@ -287,6 +291,28 @@ class PetSettingsDialog(QDialog):
             bool(self.config.get("stay_still", False))
         )
 
+        self._llm_provider = QComboBox()
+        for key in ("ollama", "openai", "anthropic", "openrouter"):
+            self._llm_provider.addItem(PROVIDER_LABELS[key], key)
+        self._select_combo(self._llm_provider, self.config.get("llm_provider", "ollama"))
+
+        self._llm_api_key = QLineEdit(self.config.get("llm_api_key", ""))
+        self._llm_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._llm_api_key.setPlaceholderText("Only needed for OpenAI / Anthropic / OpenRouter")
+
+        self._llm_model_override = QLineEdit(self.config.get("llm_model_override", ""))
+        self._llm_model_override.setPlaceholderText("Optional — blank uses the provider's default model")
+
+        llm_note = QLabel(
+            "Ollama (default) runs fully local and needs no key — the AI "
+            "Performance tab below only applies to it. Switching to OpenAI, "
+            "Anthropic, or OpenRouter sends activity context (and screenshots, "
+            "if vision is on) to that provider's API using your key. Your key "
+            "is stored locally in pet_config.json on this machine only."
+        )
+        llm_note.setWordWrap(True)
+        llm_note.setStyleSheet("color: #666; font-size: 11px;")
+
         keystroke_note = QLabel(
             "Off by default — nothing is captured unless this is checked. "
             "When ON, the pet occasionally glances at a few recent "
@@ -308,6 +334,10 @@ class PetSettingsDialog(QDialog):
         form.addRow(self._keystroke_commentary)
         form.addRow(keystroke_note)
         form.addRow(self._stay_still)
+        form.addRow("AI Provider", self._llm_provider)
+        form.addRow("API Key", self._llm_api_key)
+        form.addRow("Model override", self._llm_model_override)
+        form.addRow(llm_note)
 
         layout.addLayout(form)
 
@@ -337,7 +367,7 @@ class PetSettingsDialog(QDialog):
         self.mode_combo.addItem("Low (2B CPU-optimized)", "low")
         self.mode_combo.addItem("Medium (2B GPU-accelerated)", "medium")
         self.mode_combo.addItem("High (4B GPU-preferred)", "high")
-        self.mode_combo.addItem("Extreme (12B High-end GPU)", "extreme")
+        self.mode_combo.addItem("Extreme (26B High-end GPU)", "extreme")
         self.mode_combo.addItem("Engine Only (Disable local AI)", "engine_only")
         
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
@@ -460,7 +490,7 @@ class PetSettingsDialog(QDialog):
             self.details_label.setText(text)
 
         # Check if selected mode exceeds recommended mode
-        tiers_order = ["engine_only", "low", "medium", "high", "extreme"]
+        tiers_order = TIER_ORDER
         try:
             sel_idx = tiers_order.index(target_mode)
             rec_idx = tiers_order.index(rec_mode)
@@ -541,14 +571,38 @@ class PetSettingsDialog(QDialog):
             res = bench_dlg.result
             self.perf_state["benchmarkResults"][target_mode] = res
             self.perf_state["benchmarkTimestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            
-            # Save resolution backend
-            if res.get("classification") == "failed":
+
+            budget = res.get("latency_budget_s", DEFAULT_LATENCY_BUDGET_S)
+            classification = res.get("classification")
+
+            # A "failed" classification means this tier can't reliably return
+            # a response within the latency budget (either warm generation is
+            # too slow, or the cold-load spike alone blows past the budget).
+            # Don't just warn and leave a slow tier active — step it down for
+            # real, so "up the model" never silently means "30-100s waits".
+            if classification == "failed" and target_mode != "engine_only":
+                lower_mode = step_down_tier(target_mode)
+                self.perf_state["selectedMode"] = lower_mode
+                self._select_combo(self.mode_combo, lower_mode)
                 QMessageBox.warning(
                     self,
-                    "Benchmark Warning",
-                    f"Benchmark classified this tier as FAILED (latency: {res.get('warm_latency', 0.0):.2f}s). "
-                    "You may experience sluggishness. We recommend a lower performance tier."
+                    "Performance Tier Automatically Downgraded",
+                    f"'{target_mode.upper()}' can't reliably respond within the "
+                    f"{budget:.0f}s budget (cold load: {res.get('cold_load_time', 0.0):.1f}s, "
+                    f"warm latency: {res.get('warm_latency', 0.0):.2f}s).\n\n"
+                    f"Automatically stepped down to '{lower_mode.upper()}'. "
+                    "Run diagnostics again to verify the new tier, or pick a "
+                    "different one manually."
+                )
+            elif classification == "marginal" and not res.get("meets_latency_budget", True):
+                QMessageBox.warning(
+                    self,
+                    "Performance Tier Near Budget Limit",
+                    f"'{target_mode.upper()}' is usable but its cold-load time "
+                    f"({res.get('cold_load_time', 0.0):.1f}s) exceeds the "
+                    f"{budget:.0f}s response budget — expect a slow first "
+                    "reply after any idle period. Consider a lower tier if "
+                    "that's noticeable."
                 )
 
         self.update_diag_display()
@@ -630,7 +684,7 @@ class PetSettingsDialog(QDialog):
         target_mode = mode_id if mode_id != "auto" else rec_mode
 
         # Check if selected exceeds recommended
-        tiers_order = ["engine_only", "low", "medium", "high", "extreme"]
+        tiers_order = TIER_ORDER
         try:
             sel_idx = tiers_order.index(target_mode)
             rec_idx = tiers_order.index(rec_mode)
@@ -704,6 +758,9 @@ class PetSettingsDialog(QDialog):
                 "sleep_after": self._sleep_after.value(),
                 "keystroke_commentary": self._keystroke_commentary.isChecked(),
                 "stay_still": self._stay_still.isChecked(),
+                "llm_provider": self._llm_provider.currentData(),
+                "llm_api_key": self._llm_api_key.text().strip(),
+                "llm_model_override": self._llm_model_override.text().strip(),
             },
             "performance": self.perf_state
         }

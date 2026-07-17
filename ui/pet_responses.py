@@ -133,6 +133,52 @@ DRAG_RESPONSES = [
     "*giggly wobble*",
 ]
 
+# ------------------------------------------------------------- mouse tickle
+# Fired when the user wiggles the cursor rapidly over the pet without
+# clicking (see DesktopPetWindow._track_wiggle) — a "tickle". Split into a
+# giggle-in-place set and a giggle-then-flee set (picked with some
+# probability by _react_to_tickle) so the reaction isn't always identical.
+TICKLE_GIGGLE_LINES = [
+    "Hee hee, that tickles!",
+    "*wiggles* Stoppit, that's silly!",
+    "Ehehe, right there!",
+    "*squishy giggling*",
+    "Okay okay, I'm ticklish, apparently!",
+    "*shakes all over, laughing*",
+    "Hehe! Didn't know I could do that!",
+    "*wobbles helplessly, giggling*",
+    "Oo that's a weird spot, hehe.",
+    "*muffled giggle-squish*",
+    "Ack, tickly!",
+    "*bounces with laughter*",
+    "Pfft, okay that got me.",
+    "Hehehe, cursor's got jokes.",
+    "*jiggles, delighted*",
+    "That's my ticklish spot, how'd you know?!",
+    "*snort-giggle*",
+    "Okay that's just unfair, hehe.",
+    "*full-body giggle wobble*",
+    "Eep, hehe, again!",
+]
+
+TICKLE_FLEE_LINES = [
+    "Okay too much, scooting away! *giggling*",
+    "Nope nope, ticklish evacuation!",
+    "Hehe, can't take it, bye!",
+    "*giggle-flees*",
+    "Abort, abort, too ticklish!",
+    "Okay that's it, I'm relocating! Hehe.",
+    "*scurries off, still laughing*",
+    "Mercy! Regrouping over there!",
+    "Hehehe, nope, new spot for me!",
+    "Can't handle it, retreating! *giggles*",
+    "Okay okay, tactical wobble away!",
+    "*wheeze-giggles and bolts*",
+    "Too much tickle, emergency relocation!",
+    "Yipe, hehe, elsewhere please!",
+    "*giggling escape*",
+]
+
 # App names as reported by WM_CLASS / process name are often terse or
 # machine-y (e.g. "code", "chromium-browser", "org.gnome.TextEditor"). Map
 # the common ones to something a person would actually call the app.
@@ -191,3 +237,9 @@ def random_window_close_line(app_name):
 def random_drag_line():
     """One instant, non-LLM line for when the user starts dragging the pet."""
     return random.choice(DRAG_RESPONSES)
+
+
+def random_tickle_line(fleeing=False):
+    """One instant, non-LLM line for when the user wiggles the cursor over
+    the pet (see DesktopPetWindow._track_wiggle / _react_to_tickle)."""
+    return random.choice(TICKLE_FLEE_LINES if fleeing else TICKLE_GIGGLE_LINES)

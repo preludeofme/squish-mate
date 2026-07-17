@@ -17,6 +17,7 @@ delivery onto the GUI thread.
 
 import random
 import time
+from collections import deque
 
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -35,7 +36,7 @@ from ui.blob_renderer import BlobRenderer
 from ui.pet_animator import PetAnimator, Pose
 from ui.pet_debug import DebugDialog
 from ui.pet_expressions import Emotion, classify_emotion
-from ui.pet_responses import random_drag_line
+from ui.pet_responses import random_drag_line, random_tickle_line
 from ui.pet_settings import MOVE_FREQUENCY_PRESETS
 from ui.pet_transcript import TranscriptDialog, TranscriptLog
 
@@ -48,6 +49,15 @@ CLICK_DRAG_THRESHOLD = 6  # px of travel before a press becomes a drag
 # an emotion." The transcript still records the classified tone regardless.
 EXPRESSION_SHOW_PROB = 0.45
 EXPRESSION_MIN_GAP_S = 6.0  # and never back-to-back even if the roll hits
+
+# Mouse "wiggle" tickle detection — a rapid back-and-forth hover over the
+# pet (not a click/drag) reads as "tickling" it, distinct from just resting
+# the cursor on top of it. See DesktopPetWindow._track_wiggle.
+WIGGLE_WINDOW_S = 0.6        # only look at samples from the last N seconds
+WIGGLE_MIN_REVERSALS = 3     # direction changes required within that window
+WIGGLE_MIN_TRAVEL_PX = 40.0  # total travel required (filters out tiny jitter)
+TICKLE_COOLDOWN_S = 6.0      # don't re-trigger the reaction back-to-back
+TICKLE_FLEE_PROB = 0.35      # chance a tickle also triggers a flee, not just a giggle
 
 _PET_FLAGS = (Qt.WindowType.FramelessWindowHint
               | Qt.WindowType.WindowStaysOnTopHint
@@ -121,6 +131,7 @@ class DesktopPetWindow(QWidget):
     bubble_requested = Signal(object)  # thread-safe entry point for the brain
     window_closed_reaction = Signal(str)  # thread-safe: an app window closed
     settings_requested = Signal()   # right-click → Settings…
+    change_pet_requested = Signal()  # right-click → Change Pet…
     quit_requested = Signal()       # right-click → Quit
     pet_clicked = Signal(str)       # click or drag interaction
 
@@ -133,6 +144,8 @@ class DesktopPetWindow(QWidget):
         self.setFixedSize(self.W, self.H)
         self.setMouseTracking(True)
         self._last_hover_event_time = 0.0
+        self._hover_samples = deque(maxlen=20)
+        self._last_tickle_t = -999.0
 
         self.animator = PetAnimator(self.W, self.H)
         self.renderer = BlobRenderer(self.W, self.H)
@@ -194,6 +207,7 @@ class DesktopPetWindow(QWidget):
         color = config.get("color")
         if color:
             self.renderer.apply_color(color)
+        self.renderer.apply_pattern(config.get("pattern", "plain"))
         ranges = MOVE_FREQUENCY_PRESETS.get(
             config.get("move_frequency", "normal"), MOVE_FREQUENCY_PRESETS["normal"])
         self.animator.set_frequencies(
@@ -353,6 +367,7 @@ class DesktopPetWindow(QWidget):
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         menu.addAction("Settings…", self.settings_requested.emit)
+        menu.addAction("Change Pet…", self.change_pet_requested.emit)
         menu.addAction("Transcript…", self.open_transcript)
         menu.addAction("Debug…", self.open_debug)
         menu.addSeparator()
@@ -376,6 +391,7 @@ class DesktopPetWindow(QWidget):
             if now - self._last_hover_event_time > 0.5:
                 self._last_hover_event_time = now
                 self.pet_clicked.emit("hover")
+            self._track_wiggle(event.globalPosition().x(), now)
             return
         delta = event.globalPosition() - self._press_pos
         if (not self._dragging
@@ -393,6 +409,53 @@ class DesktopPetWindow(QWidget):
             self.move(int(nx), int(ny))
             if self.bubble.isVisible():
                 self._position_bubble()
+
+    def _track_wiggle(self, global_x, now):
+        """Detect a rapid back-and-forth cursor wiggle over the pet (a
+        "tickle") distinct from just resting the cursor on top of it —
+        counts direction reversals in recent horizontal movement within
+        WIGGLE_WINDOW_S."""
+        self._hover_samples.append((now, global_x))
+        while self._hover_samples and now - self._hover_samples[0][0] > WIGGLE_WINDOW_S:
+            self._hover_samples.popleft()
+        if len(self._hover_samples) < 5:
+            return
+        xs = [x for _, x in self._hover_samples]
+        reversals = 0
+        total_travel = 0.0
+        direction = 0
+        for i in range(1, len(xs)):
+            dx = xs[i] - xs[i - 1]
+            total_travel += abs(dx)
+            if abs(dx) < 1.0:
+                continue
+            d = 1 if dx > 0 else -1
+            if direction != 0 and d != direction:
+                reversals += 1
+            direction = d
+        if reversals < WIGGLE_MIN_REVERSALS or total_travel < WIGGLE_MIN_TRAVEL_PX:
+            return
+        if now - self._last_tickle_t < TICKLE_COOLDOWN_S:
+            return
+        self._last_tickle_t = now
+        self._hover_samples.clear()
+        self._react_to_tickle()
+
+    def _react_to_tickle(self):
+        """Instant, non-LLM reaction to being "tickled" by a mouse wiggle —
+        mostly a giggle in place, sometimes a giggle-and-flee."""
+        self.animator.notify_activity()
+        if random.random() < TICKLE_FLEE_PROB:
+            geo = self._screen_geometry()
+            self.show_bubble(random_tickle_line(fleeing=True), duration_ms=1600)
+            # surprise_and_flee both plays a startled pop and sets a target
+            # elsewhere on screen — a giggle pose would just be immediately
+            # overwritten by it, so skip straight to the flee reaction here.
+            self.animator.surprise_and_flee(
+                (geo.x(), geo.y(), geo.width(), geo.height()))
+        else:
+            self.show_bubble(random_tickle_line(), duration_ms=1600)
+            self.animator.trigger_giggle(force=True)
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:

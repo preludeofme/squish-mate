@@ -10,7 +10,7 @@ if [[ ! -x "$VENV_PY" ]]; then
     echo "Project venv not found at $VENV_PY"
     echo "Create it and install deps:"
     echo "  python3 -m venv .venv"
-    echo "  .venv/bin/pip install PySide6 psutil requests pillow"
+    echo "  .venv/bin/pip install PySide6 psutil requests pynput Pillow"
     exit 1
 fi
 

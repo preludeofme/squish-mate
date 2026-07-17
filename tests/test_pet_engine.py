@@ -81,12 +81,26 @@ class TestPetEngine(unittest.TestCase):
 
     def test_typing_suppression(self):
         self.engine.register_event("typing_started", "editor", "User started typing")
-        event = Event("application_changed", "vscode", "Editing main file", topic="coding")
-        event.isMeaningfulChange = True
-        
-        gating = self.engine.get_behavior_gating(event)
+
+        # Events not tied to a deliberate user action (e.g. periodic idle
+        # chatter) are still suppressed while actively typing.
+        idle_event = Event("idle_comment", "system", "Periodic idle comment")
+        idle_event.isMeaningfulChange = True
+        gating = self.engine.get_behavior_gating(idle_event)
         self.assertFalse(gating["allowSpeech"])
         self.assertEqual(gating["reason"], "typing_suppression")
+
+        # Real app switches and clicks are themselves a break from typing,
+        # so they're exempt from typing suppression.
+        app_event = Event("application_changed", "vscode", "Editing main file", topic="coding")
+        app_event.isMeaningfulChange = True
+        gating2 = self.engine.get_behavior_gating(app_event)
+        self.assertNotEqual(gating2["reason"], "typing_suppression")
+
+        click_event = Event("click_activity", "vscode", "Editing main file", topic="coding")
+        click_event.isMeaningfulChange = True
+        gating3 = self.engine.get_behavior_gating(click_event)
+        self.assertNotEqual(gating3["reason"], "typing_suppression")
 
     # 3. Energy and Sleep
     def test_energy_drain_and_costs(self):
@@ -99,14 +113,19 @@ class TestPetEngine(unittest.TestCase):
         expected_drain = self.engine.config["energyPassiveDrainRate"] * 10.0
         self.assertAlmostEqual(initial_energy - drained_energy, expected_drain)
 
-        # Triggering an action should consume energy
+        # Triggering an action should change energy — most actions consume
+        # it, but "eat" restores it, so branch the assertion on which was
+        # selected instead of assuming a universal drain.
         self.engine.state["emotion"]["current"] = "happy"
         self.engine.state["energy"]["current"] = 80.0
         gating = {"allowMovement": True}
         action = self.engine.select_action(gating)
         self.assertNotEqual(action, "idle")
         final_energy = self.engine.state["energy"]["current"]
-        self.assertTrue(final_energy < 80.0)
+        if action == "eat":
+            self.assertTrue(final_energy > 80.0)
+        else:
+            self.assertTrue(final_energy < 80.0)
 
     def test_sleep_and_wake(self):
         # Force Sleepiness
