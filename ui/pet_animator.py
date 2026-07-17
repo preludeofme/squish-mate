@@ -113,6 +113,9 @@ class PetAnimator:
         self._ant_vel = 0.0
         self._prev_offset_y = 0.0
 
+        # Store screen geometry updated on each frame
+        self.last_screen = (0, 0, 1920, 1080)
+
         # Blink scheduling.
         self._next_blink = 2.5
         self._blink_start = -1.0
@@ -123,6 +126,7 @@ class PetAnimator:
         self._next_wander = self._sched(*self.wander_range)  # big travel moves: rare
         self._next_action = self._sched(*self.action_range)
         self._last_interaction = 0.0
+        self.stay_still = False
 
         # Facial expression overlay (see pet_expressions.py) — independent of
         # `self.state` above, which drives BODY/movement behavior (hop, wave,
@@ -132,6 +136,11 @@ class PetAnimator:
         self.expression = Emotion.NEUTRAL
         self._expr_start = 0.0
         self._expr_end = 0.0
+
+    @property
+    def current_state(self):
+        """Returns the lowercase name of the current animation state."""
+        return self.state.name.lower()
 
     # ----------------------------------------------------------- transitions
     def _sched(self, lo, hi):
@@ -243,6 +252,46 @@ class PetAnimator:
         if force or self.state is PetState.IDLE:
             self._enter(PetState.SLEEP)
 
+    def trigger_wander(self, force=False):
+        if force or self.state is PetState.IDLE:
+            sx, sy, sw, sh = self.last_screen
+            self.target_x = random.uniform(sx, sx + max(0, sw - self.win_w))
+            self.target_y = random.uniform(sy + 60, sy + max(60, sh - self.win_h))
+            self.moving = True
+            if self.state is not PetState.IDLE:
+                self._enter(PetState.IDLE)
+
+    def trigger_screen_traversal(self, force=False):
+        if force or self.state is PetState.IDLE:
+            sx, sy, sw, sh = self.last_screen
+            cx = self.x + self.win_w / 2
+            if cx < sx + sw / 2:
+                self.target_x = random.uniform(sx + sw * 0.6, sx + max(0, sw - self.win_w))
+            else:
+                self.target_x = random.uniform(sx, sx + sw * 0.4)
+            self.target_y = random.uniform(sy + 60, sy + max(60, sh - self.win_h))
+            self.moving = True
+            if self.state is not PetState.IDLE:
+                self._enter(PetState.IDLE)
+
+    def trigger_wobble(self, force=False):
+        self.trigger_hop(force=force)
+
+    def trigger_bounce(self, force=False):
+        self.trigger_hop(force=force)
+
+    def trigger_excited(self, force=False):
+        self.trigger_dance(force=force)
+
+    def trigger_settle(self, force=False):
+        self.trigger_stretch(force=force)
+
+    def trigger_rest(self, force=False):
+        self.trigger_yawn(force=force)
+
+    def trigger_peek(self, force=False):
+        self.trigger_wave(force=force)
+
     def notify_activity(self):
         """Something happened (bubble shown, user interacted) — stay awake."""
         self._last_interaction = self.t
@@ -266,6 +315,7 @@ class PetAnimator:
         dt = _clamp(dt, 0.0, 0.1)
         self.t += dt
         self.state_time += dt
+        self.last_screen = screen
 
         pose = Pose(t=self.t)
 
@@ -330,7 +380,7 @@ class PetAnimator:
             self._next_action = self._sched(*self.action_range)
             self._enter(random.choice(ACTION_STATES))
             return
-        if not self.moving and self.t >= self._next_wander:
+        if not self.stay_still and not self.moving and self.t >= self._next_wander:
             sx, sy, sw, sh = screen
             self.target_x = random.uniform(sx, sx + max(0, sw - self.win_w))
             self.target_y = random.uniform(sy + 60, sy + max(60, sh - self.win_h))

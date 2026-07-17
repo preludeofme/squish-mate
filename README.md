@@ -17,9 +17,11 @@ A lightweight, cross-platform desktop pet (Squish-Mate) that monitors your activ
 - PySide6 (procedural vector rendering — no image assets)
 - psutil (for system monitoring)
 - requests + a local Ollama server (optional, for LLM comments)
+- pynput (for mouse/keyboard activity tracking)
+- Pillow (for screenshots/image utilities)
 - Operating system-specific libraries:
   - Windows: pywin32
-  - Linux: xdotool (for window information)
+  - Linux: xdotool, wmctrl (for active window detection)
 
 ## Installation
 
@@ -32,12 +34,13 @@ cd squish-mate
 2. Install dependencies:
 ```bash
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install PySide6 psutil requests
+.venv/bin/pip install PySide6 psutil requests pynput Pillow
 ```
 
 3. Run Squish-Mate:
 ```bash
-.venv/bin/python desktop_pet.py
+./run_pet.sh
+# or: .venv/bin/python desktop_pet.py
 # or: python3 run_pet.py  (auto-uses .venv if present)
 ```
 
@@ -95,6 +98,12 @@ The project is designed to be:
 - Modular with separate components
 - Easy to extend with new app types
 - Cross-platform compatible
+
+## Support
+
+If you enjoy using Squish-Mate, please consider supporting its development!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-orange?style=flat-square&logo=buy-me-a-coffee)](https://buymeacoffee.com/preludeofme)
 
 ## License
 

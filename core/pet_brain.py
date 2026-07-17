@@ -24,7 +24,7 @@ try:
 except ImportError:
     requests = None
 
-MODEL_NAME = "gemma-4-E4B-it-qat-q4_0-gguf:latest"
+MODEL_NAME = "gemma4:e4b"
 OLLAMA_URL = "http://localhost:11434"
 DEBUG = os.environ.get("PET_BRAIN_DEBUG", "1") != "0"
 
@@ -83,7 +83,7 @@ def _sanitize(text, limit=160):
 class PetBrain:
     def __init__(self, model=MODEL_NAME, memory=None, ollama_url=OLLAMA_URL,
                  cooldown=30.0, timeout=25.0, system_prompt=None, engine=None):
-        self.model = model
+        self._model = model
         self.memory = memory
         self.url = ollama_url.rstrip("/")
         self.cooldown = cooldown
@@ -94,6 +94,34 @@ class PetBrain:
         self._persona_extra = ""
         self._base_system_prompt = (system_prompt or "").strip() or SYSTEM_PROMPT
         self._recent_lines = deque(maxlen=6)
+
+    @property
+    def model(self):
+        if self.engine and hasattr(self.engine, "state") and self.engine.state:
+            perf = self.engine.state.get("performance", {})
+            resolved = perf.get("resolvedMode", "low")
+            if resolved == "engine_only":
+                return "engine_only"
+            from core.pet_performance import PERFORMANCE_MODES
+            cfg = PERFORMANCE_MODES.get(resolved)
+            if cfg:
+                return cfg["model"]
+        return self._model
+
+    @model.setter
+    def model(self, value):
+        self._model = value
+
+    def _get_mode_options(self):
+        if self.engine and hasattr(self.engine, "state") and self.engine.state:
+            perf = self.engine.state.get("performance", {})
+            resolved = perf.get("resolvedMode", "low")
+            from core.pet_performance import PERFORMANCE_MODES
+            cfg = PERFORMANCE_MODES.get(resolved)
+            if cfg:
+                return cfg.get("options", {}), cfg.get("keepAlive", "2m")
+        return {}, "5m"
+
 
     def set_persona(self, traits=None, initial_prompt=""):
         parts = []
@@ -133,6 +161,8 @@ class PetBrain:
 
     def _chat(self, system, user, num_predict=200, temperature=0.75,
               image_b64=None, max_retries=1, log_prompt=True):
+        if self.model == "engine_only":
+            return None
         if requests is None:
             return None
         
@@ -140,7 +170,34 @@ class PetBrain:
             try:
                 user_message = {"role": "user", "content": user}
                 if image_b64:
-                    user_message["images"] = [image_b64]
+                    allowed_vision = True
+                    if self.engine and hasattr(self.engine, "state") and self.engine.state:
+                        perf = self.engine.state.get("performance", {})
+                        resolved = perf.get("resolvedMode", "low")
+                        from core.pet_performance import PERFORMANCE_MODES
+                        cfg = PERFORMANCE_MODES.get(resolved)
+                        if cfg and not cfg.get("visionEnabled", False):
+                            allowed_vision = False
+                        if not perf.get("visionPreference", True):
+                            allowed_vision = False
+                            
+                    if allowed_vision:
+                        user_message["images"] = [image_b64]
+                
+                mode_opts, keep_alive = self._get_mode_options()
+                
+                if self.engine and hasattr(self.engine, "state") and self.engine.state:
+                    perf = self.engine.state.get("performance", {})
+                    if perf.get("temporaryFallbackState") or perf.get("keepAlivePreference") == "unload_immediate":
+                        keep_alive = "0s"
+                        
+                req_options = {
+                    "num_predict": num_predict,
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                }
+                if mode_opts:
+                    req_options.update(mode_opts)
                 
                 r = requests.post(
                     f"{self.url}/api/chat",
@@ -151,11 +208,8 @@ class PetBrain:
                             user_message,
                         ],
                         "stream": False,
-                        "options": {
-                            "num_predict": num_predict,
-                            "temperature": temperature,
-                            "top_p": 0.9,
-                        },
+                        "keep_alive": keep_alive,
+                        "options": req_options,
                     },
                     timeout=self.timeout,
                 )
@@ -170,6 +224,8 @@ class PetBrain:
         return None
 
     def available(self):
+        if self.model == "engine_only":
+            return False
         if requests is None:
             return False
         try:
@@ -177,6 +233,7 @@ class PetBrain:
             return r.status_code == 200
         except Exception:
             return False
+
 
     def _cooling_down(self):
         return (time.time() - self._last_call) < self.cooldown

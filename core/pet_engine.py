@@ -218,6 +218,44 @@ class MeaningfulChangeDetector:
 
         return False
 
+    def guess_topic(self, active_app, window_title):
+        if not active_app or not window_title:
+            return "general"
+        
+        app = str(active_app).lower()
+        title = str(window_title).lower()
+        
+        # Coding / Development
+        if any(x in app for x in ("code", "vscode", "pycharm", "eclipse", "terminal", "bash", "sh", "zsh", "tmux", "kitty", "alacritty", "iterm", "gnome-terminal")) or \
+           any(x in title for x in ("python", "javascript", "typescript", "c++", " rust ", "compile", "build", "git", "github", "gitlab", "pull request", "merge", "debugger", "stack overflow")):
+            return "coding"
+            
+        # Social / Chat
+        if any(x in app for x in ("discord", "slack", "teams", "zoom", "skype", "telegram", "whatsapp", "signal", "chat")) or \
+           any(x in title for x in ("discord", "slack", "teams", "chat", "message", "dm")):
+            return "chatting"
+            
+        # Video / Streaming
+        if any(x in app for x in ("youtube", "netflix", "vlc", "mpv", "spotify", "twitch")) or \
+           any(x in title for x in ("youtube", "netflix", "video", "movie", "watch", "stream", "music", "spotify")):
+            return "media"
+            
+        # Web Browsing
+        if any(x in app for x in ("chrome", "firefox", "safari", "edge", "opera", "browser")):
+            return "browsing"
+            
+        # Gaming
+        if any(x in app for x in ("steam", "minecraft", "game", "retroarch", "itch.io")) or \
+           any(x in title for x in ("game", "play", "steam")):
+            return "gaming"
+            
+        # Writing / Docs
+        if any(x in app for x in ("libreoffice", "word", "excel", "powerpoint", "obsidian", "notion", "document", "writer")) or \
+           any(x in title for x in ("doc", "notes", "write", "pdf", "sheet", "slide", "readme")):
+            return "writing"
+            
+        return "general"
+
 
 class PetEngine:
     def __init__(self, state_path=STATE_PATH, config=None):
@@ -327,8 +365,24 @@ class PetEngine:
                 "topics": [],
                 "actions": [],
                 "events": []
+            },
+            "performance": {
+                "selectedMode": "auto",
+                "resolvedMode": "low",
+                "recommendedMode": "low",
+                "hardwareSummary": {},
+                "benchmarkResults": {},
+                "benchmarkTimestamp": None,
+                "modelDigests": {},
+                "ollamaVersion": None,
+                "lastKnownWorkingTier": "engine_only",
+                "warningAcknowledgements": [],
+                "visionPreference": True,
+                "keepAlivePreference": "default",
+                "temporaryFallbackState": None
             }
         }
+
 
     def _migrate_state(self, loaded, from_ver, to_ver):
         # Placeholders for future migrations
@@ -466,6 +520,9 @@ class PetEngine:
             recovered = energy["recoveryRate"] * elapsed_minutes
             energy["current"] = min(energy["maximum"], energy["current"] + recovered)
             needs["sleepiness"] = max(0.0, needs["sleepiness"] - 0.12 * elapsed_minutes)
+            self.state["lastWakeAt"] = now.isoformat()
+            self.state["emotion"]["current"] = "neutral"
+            self.state["behavior"]["currentAction"] = "idle"
             logger.info(f"Pip woke up after offline sleep. Recovered {recovered:.2f} energy.")
         else:
             # Awake offline: drain energy up to drain cap (don't drain to zero to avoid collapse)
@@ -621,12 +678,22 @@ class PetEngine:
                 if is_direct:
                     self.state["needs"]["engagement"] = min(1.0, self.state["needs"]["engagement"] + 0.3)
                     self.state["relationship"]["interactionCount"] += 1
-                    # Wakes up if asleep
+                    
+                    is_hover = raw_type == "hover_interaction"
+                    energy_boost = 2.0 if is_hover else 30.0
+                    
+                    self.state["needs"]["sleepiness"] = max(0.0, self.state["needs"]["sleepiness"] - (0.02 if is_hover else 0.25))
+                    self.state["energy"]["current"] = min(self.state["energy"]["maximum"], self.state["energy"]["current"] + energy_boost)
+                    
+                    # Wakes up if asleep and we clicked or wiggled enough to charge energy/wake thresholds
                     if self._is_sleeping_locked():
-                        self.state["lastWakeAt"] = datetime.now().isoformat()
-                        self.state["emotion"]["current"] = "neutral"
-                        self.state["behavior"]["currentAction"] = "idle"
-                        logger.info("Pip was woken up by a direct message.")
+                        should_wake = not is_hover or (self.state["energy"]["current"] >= self.config["energyWakeThreshold"])
+                        if should_wake:
+                            self.state["lastWakeAt"] = datetime.now().isoformat()
+                            self.state["emotion"]["current"] = "neutral"
+                            self.state["behavior"]["currentAction"] = "idle"
+                            self.state["needs"]["sleepiness"] = min(self.state["needs"]["sleepiness"], 0.2)
+                            logger.info("Pip was woken up by interaction.")
 
                 # 3. Deterministic emotion update based on event
                 self._update_emotion_from_event_locked(event)
@@ -699,6 +766,11 @@ class PetEngine:
                 "maximumEnergyCost": 2.0
             }
 
+            if event.type == "hover_interaction":
+                gating["allowSpeech"] = False
+                gating["reason"] = "hover_no_speech"
+                return gating
+
             # Check if sleeping
             if self._is_sleeping_locked():
                 gating["allowSpeech"] = False
@@ -709,16 +781,18 @@ class PetEngine:
                 return gating
 
             # Check if typing is active (suppress comment if typed within 15 seconds)
-            last_typing_str = self.state["behavior"].get("lastTypingAt")
-            if last_typing_str:
-                try:
-                    last_typing = datetime.fromisoformat(last_typing_str)
-                    if (datetime.now() - last_typing).total_seconds() < self.config["typingSuppressionDuration"]:
-                        gating["allowSpeech"] = False
-                        gating["reason"] = "typing_suppression"
-                        return gating
-                except ValueError:
-                    pass
+            # Direct interactions and typing events are exempt from typing suppression
+            if not event.isDirectInteraction and event.type not in ("typing_started", "typing_continued"):
+                last_typing_str = self.state["behavior"].get("lastTypingAt")
+                if last_typing_str:
+                    try:
+                        last_typing = datetime.fromisoformat(last_typing_str)
+                        if (datetime.now() - last_typing).total_seconds() < self.config["typingSuppressionDuration"]:
+                            gating["allowSpeech"] = False
+                            gating["reason"] = "typing_suppression"
+                            return gating
+                    except ValueError:
+                        pass
 
             # Direct interaction bypasses almost all speech checks
             if event.isDirectInteraction:
@@ -726,7 +800,8 @@ class PetEngine:
                 return gating
 
             # If not a meaningful change, suppress speech
-            if not event.isMeaningfulChange:
+            # Typing events are exempt from meaningful change checks
+            if event.type not in ("typing_started", "typing_continued") and not event.isMeaningfulChange:
                 gating["allowSpeech"] = False
                 gating["reason"] = "not_meaningful"
                 return gating
@@ -791,6 +866,8 @@ class PetEngine:
             allowed = []
             for name, meta in ACTION_METADATA.items():
                 if name in ("sleep", "idle"):
+                    continue
+                if gating_result and gating_result.get("stayStill", False) and name in ("wander", "screen_traversal"):
                     continue
                 if energy >= meta["min_energy"] and current_emotion in meta["emotions"]:
                     allowed.append((name, meta["cost"]))

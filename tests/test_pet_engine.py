@@ -43,6 +43,17 @@ class TestPetEngine(unittest.TestCase):
         self.assertIn("[email filtered]", filtered_email)
         self.assertNotIn("admin@test.com", filtered_email)
 
+    def test_guess_topic(self):
+        from core.pet_engine import MeaningfulChangeDetector
+        detector = MeaningfulChangeDetector()
+        self.assertEqual(detector.guess_topic("vscode", "index.py"), "coding")
+        self.assertEqual(detector.guess_topic("discord", "General Chat"), "chatting")
+        self.assertEqual(detector.guess_topic("youtube", "Cute Cats Video"), "media")
+        self.assertEqual(detector.guess_topic("firefox", "https://google.com"), "browsing")
+        self.assertEqual(detector.guess_topic("steam", "Dota 2"), "gaming")
+        self.assertEqual(detector.guess_topic("libreoffice", "My Document"), "writing")
+        self.assertEqual(detector.guess_topic("unknown", "some other window"), "general")
+
     def test_event_normalization(self):
         evt = self.engine.register_event("build_failed", "terminal", "Failed to build: API_KEY=abc123xyz")
         self.assertEqual(evt.type, "build_failed")
@@ -125,6 +136,19 @@ class TestPetEngine(unittest.TestCase):
         # Awake offline should drain, but capped to not reach 0 (holds min 15)
         self.assertTrue(final_energy < 80.0)
         self.assertTrue(final_energy >= 15.0)
+
+        # Test sleeping offline: should wake up and recover energy
+        self.engine.force_sleep()
+        self.assertTrue(self.engine.is_sleeping())
+        self.engine.state["energy"]["current"] = 10.0
+        self.engine.state["lastActiveAt"] = (datetime.now() - timedelta(hours=5)).isoformat()
+        self.engine.save_state(immediate=True)
+
+        self.engine.load_state()
+        self.assertFalse(self.engine.is_sleeping())
+        self.assertTrue(self.engine.state["energy"]["current"] > 10.0)
+        self.assertEqual(self.engine.state["emotion"]["current"], "neutral")
+        self.assertEqual(self.engine.state["behavior"]["currentAction"], "idle")
 
     # 4. Memories
     def test_memory_candidates_and_deduplication(self):

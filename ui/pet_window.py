@@ -122,6 +122,7 @@ class DesktopPetWindow(QWidget):
     window_closed_reaction = Signal(str)  # thread-safe: an app window closed
     settings_requested = Signal()   # right-click → Settings…
     quit_requested = Signal()       # right-click → Quit
+    pet_clicked = Signal(str)       # click or drag interaction
 
     W, H = 150, 180
 
@@ -130,6 +131,8 @@ class DesktopPetWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(self.W, self.H)
+        self.setMouseTracking(True)
+        self._last_hover_event_time = 0.0
 
         self.animator = PetAnimator(self.W, self.H)
         self.renderer = BlobRenderer(self.W, self.H)
@@ -197,6 +200,7 @@ class DesktopPetWindow(QWidget):
             hop_range=ranges["hop"], wave_range=ranges["wave"],
             wander_range=ranges["wander"],
             sleep_after=config.get("sleep_after", 120))
+        self.animator.stay_still = config.get("stay_still", False)
         self._pet_name = config.get("name") or self._pet_name
         self.update()
 
@@ -320,6 +324,11 @@ class DesktopPetWindow(QWidget):
             self._debug_dialog.raise_()
             self._debug_dialog.activateWindow()
 
+    def open_coffee(self):
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl("https://buymeacoffee.com/preludeofme"))
+
     def _on_window_closed(self, text):
         """An app window closed elsewhere on the desktop — instant canned
         goodbye (no LLM call, so it lands right away instead of ~a minute
@@ -347,6 +356,8 @@ class DesktopPetWindow(QWidget):
         menu.addAction("Transcript…", self.open_transcript)
         menu.addAction("Debug…", self.open_debug)
         menu.addSeparator()
+        menu.addAction("Buy Me a Coffee ☕", self.open_coffee)
+        menu.addSeparator()
         menu.addAction("Quit", self.quit_requested.emit)
         menu.exec(event.globalPos())
 
@@ -357,15 +368,21 @@ class DesktopPetWindow(QWidget):
         self._press_window_pos = QPointF(self.x(), self.y())
         self._dragging = False
         self.animator.wake()
+        self.pet_clicked.emit("click")
 
     def mouseMoveEvent(self, event):
         if self._press_pos is None:
+            now = time.time()
+            if now - self._last_hover_event_time > 0.5:
+                self._last_hover_event_time = now
+                self.pet_clicked.emit("hover")
             return
         delta = event.globalPosition() - self._press_pos
         if (not self._dragging
                 and max(abs(delta.x()), abs(delta.y())) > CLICK_DRAG_THRESHOLD):
             self._dragging = True
             self.animator.start_drag()
+            self.pet_clicked.emit("drag")
             # Instant canned reaction (no LLM) so it fires the moment the
             # drag starts, not seconds/minutes later.
             self.show_bubble(random_drag_line(), duration_ms=1400)

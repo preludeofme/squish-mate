@@ -12,7 +12,7 @@ import sys
 
 
 def run_desktop_pet():
-    pet_dir = os.path.expanduser("~/Projects/Personal/desktop-pet")
+    pet_dir = os.path.expanduser("~/Projects/Personal/squish-mate")
     os.chdir(pet_dir)
     sys.path.insert(0, pet_dir)
 

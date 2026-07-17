@@ -27,7 +27,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QMessageBox, QDialog
 except ImportError as e:
     print(f"PySide6 is required: {e}")
     print("Install it with: .venv/bin/pip install PySide6 "
@@ -133,6 +133,12 @@ class DesktopPet:
             self.memory.summarizer = self.brain.summarize
         self._brain_busy = False
 
+        # Setup Request Queue and Worker
+        from core.pet_performance import BoundedRequestQueue, RuntimeAdaptationMonitor, OllamaClient, detect_hardware, recommend_mode_static, PERFORMANCE_MODES
+        self.request_queue = BoundedRequestQueue(maxsize=5)
+        self.ollama_client = OllamaClient()
+        self._currently_loaded_model = None
+
         # Idle-chatter cadence, driven by config["message_frequency"];
         # concrete values are (re)applied by apply_runtime_settings().
         self._idle_range_s = (25, 70)
@@ -204,26 +210,41 @@ class DesktopPet:
                 bool(self.config.get("keystroke_commentary", False)))
 
     def open_settings(self):
-        dialog = PetSettingsDialog(self.config, parent=self.window)
+        dialog = PetSettingsDialog(self.config, engine=self.engine, parent=self.window)
         if dialog.exec():
-            self.config.update(dialog.get_values())
+            vals = dialog.get_values()
+            self.config.update(vals["general"])
             self.save_config()
+            
+            if self.engine:
+                with self.engine.lock:
+                    self.engine.state["performance"].update(vals["performance"])
+                    # If mode is auto, resolve it based on recommendation
+                    selected = self.engine.state["performance"]["selectedMode"]
+                    if selected == "auto":
+                        self.engine.state["performance"]["resolvedMode"] = self.engine.state["performance"]["recommendedMode"]
+                    else:
+                        self.engine.state["performance"]["resolvedMode"] = selected
+                self.engine.save_state(immediate=True)
+                
             self.apply_runtime_settings()
+
+    def _on_pet_clicked(self, interaction_type):
+        if self.engine:
+            raw_type = "hover_interaction" if interaction_type == "hover" else "direct_interaction"
+            self.engine.register_event(
+                raw_type=raw_type,
+                source="ui",
+                raw_summary=f"User performed {interaction_type} on pet",
+                is_direct=True
+            )
 
     # ------------------------------------------------------------------- brain
     def process_activity_change(self, activity, reason="activity change"):
-        """Feed context about what the user is doing to the LLM brain and show
-        its comment. Runs inside the monitor daemon thread, so the blocking
-        brain.think() call is safe here; the text reaches the GUI thread via
-        the window's queued `bubble_requested` signal."""
         active_app = activity.get("active_app", "unknown")
         window_title = activity.get("window_title", "unknown")
         process_name = activity.get("process_name") or active_app
         print(f"{reason.capitalize()} detected: {active_app}")
-
-        # Guard against stacking multiple brain calls during rapid app switches.
-        if self._brain_busy:
-            return
 
         # 1. Register event in PetEngine
         event_type = "application_changed"
@@ -245,42 +266,53 @@ class DesktopPet:
             print(f"[gating] Speech blocked: {gating['reason']}")
             return
 
-        comment = None
-        if not self.brain:
-            print("[brain] PetBrain not initialized (import failed at startup?)")
-        elif not self.brain.available():
-            print("[brain] Ollama unreachable right now — using canned idle line")
-        else:
-            self._brain_busy = True
-            try:
-                ctx = {
-                    "active_app": activity.get("active_app"),
-                    "window_title": activity.get("window_title"),
-                    "process_name": process_name,
-                    "recent_apps": list(getattr(self.monitor, "apps_seen", []))[-10:],
-                }
-                screenshot_b64 = self.screen_reader.latest()
-                print(f"[brain] calling think() — screenshot={'yes' if screenshot_b64 else 'no'}")
-                comment = self.brain.think(ctx, force=True, screenshot_b64=screenshot_b64)
-            except Exception as e:
-                print(f"Brain error: {e}")
-            finally:
-                self._brain_busy = False
+        def task():
+            # Check model switching
+            current_model = self.brain.model if self.brain else "engine_only"
+            if current_model != self._currently_loaded_model:
+                if self._currently_loaded_model and self._currently_loaded_model != "engine_only":
+                    self.ollama_client.unload_model(self._currently_loaded_model)
+                self._currently_loaded_model = current_model
 
-        if not comment:
-            print("[brain] think() returned nothing (brain unavailable/error) — using canned idle line")
-            comment = random.choice(SAFE_IDLE)
+            comment = None
+            if not self.brain:
+                print("[brain] PetBrain not initialized")
+            elif self.brain.model == "engine_only":
+                pass
+            elif not self.brain.available():
+                print("[brain] Ollama unreachable right now")
+            else:
+                try:
+                    ctx = {
+                        "active_app": activity.get("active_app"),
+                        "window_title": activity.get("window_title"),
+                        "process_name": process_name,
+                        "recent_apps": list(getattr(self.monitor, "apps_seen", []))[-10:],
+                    }
+                    screenshot_b64 = self.screen_reader.latest()
+                    comment = self.brain.think(ctx, force=True, screenshot_b64=screenshot_b64)
+                except Exception as e:
+                    print(f"Brain error: {e}")
 
-        print(f"Sending message: {comment}")
-        if self.window:
-            self.window.bubble_requested.emit(comment)
-        
-        msg_text = comment["text"] if isinstance(comment, dict) else str(comment)
-        self.interaction_history.append({
-            "timestamp": datetime.now().isoformat(),
-            "type": "activity_change",
-            "app": active_app,
-            "message": msg_text,
+            if not comment:
+                comment = random.choice(SAFE_IDLE)
+
+            if self.window:
+                self.window.bubble_requested.emit(comment)
+            
+            msg_text = comment["text"] if isinstance(comment, dict) else str(comment)
+            self.interaction_history.append({
+                "timestamp": datetime.now().isoformat(),
+                "type": "activity_change",
+                "app": active_app,
+                "message": msg_text,
+            })
+
+        req_type = "direct_message" if "click" in reason else "ambient_comment"
+        self.request_queue.put({
+            "type": req_type,
+            "timestamp": time.time(),
+            "task": task
         })
 
     # --------------------------------------------------------- window closed
@@ -309,7 +341,12 @@ class DesktopPet:
         km = self.keystroke_monitor
         if not km or not self.config.get("keystroke_commentary", False):
             return
-        if not self.brain or self._brain_busy:
+        if not self.brain:
+            return
+
+        # Check if the user is actually typing (meaning a keystroke occurred within the last 15 seconds)
+        # If not, return immediately without registering a typing event or suppressing speech.
+        if (time.time() - km.get_last_keystroke_time()) > 15.0:
             return
 
         active_app = activity.get("active_app", "unknown")
@@ -346,24 +383,40 @@ class DesktopPet:
             return
 
         self._last_keystroke_reaction = now
-        self._brain_busy = True
-        try:
-            comment = self.brain.comment_on_typing(text)
-        except Exception as e:
-            print(f"Brain error (typing commentary): {e}")
-            comment = None
-        finally:
-            self._brain_busy = False
 
-        if comment and self.window:
-            self.window.bubble_requested.emit(comment)
-        
-        msg_text = comment["text"] if isinstance(comment, dict) else str(comment)
-        self.interaction_history.append({
-            "timestamp": datetime.now().isoformat(),
-            "type": "typing_commentary",
-            "app": activity.get("active_app"),
-            "message": msg_text,
+        def task():
+            current_model = self.brain.model if self.brain else "engine_only"
+            if current_model != self._currently_loaded_model:
+                if self._currently_loaded_model and self._currently_loaded_model != "engine_only":
+                    self.ollama_client.unload_model(self._currently_loaded_model)
+                self._currently_loaded_model = current_model
+
+            comment = None
+            if self.brain.model == "engine_only":
+                pass
+            elif not self.brain.available():
+                print("[brain] Ollama unreachable right now")
+            else:
+                try:
+                    comment = self.brain.comment_on_typing(text)
+                except Exception as e:
+                    print(f"Brain error (typing commentary): {e}")
+
+            if comment and self.window:
+                self.window.bubble_requested.emit(comment)
+            
+            msg_text = comment["text"] if isinstance(comment, dict) else str(comment)
+            self.interaction_history.append({
+                "timestamp": datetime.now().isoformat(),
+                "type": "typing_commentary",
+                "app": activity.get("active_app"),
+                "message": msg_text,
+            })
+
+        self.request_queue.put({
+            "type": "ambient_comment",
+            "timestamp": time.time(),
+            "task": task
         })
 
     # ------------------------------------------------------------ idle chatter
@@ -391,24 +444,32 @@ class DesktopPet:
             print(f"[gating] Idle speech blocked: {gating['reason']}")
             return
 
-        if self.brain and not self._brain_busy:
-            threading.Thread(target=self._idle_comment_worker, daemon=True).start()
-        elif self.window:
-            self.window.show_bubble(random.choice(SAFE_IDLE))
+        def task():
+            # Check model switching
+            current_model = self.brain.model if self.brain else "engine_only"
+            if current_model != self._currently_loaded_model:
+                if self._currently_loaded_model and self._currently_loaded_model != "engine_only":
+                    self.ollama_client.unload_model(self._currently_loaded_model)
+                self._currently_loaded_model = current_model
 
-    def _idle_comment_worker(self):
-        self._brain_busy = True
-        comment = None
-        try:
-            comment = self.brain.idle_comment()
-        except Exception as e:
-            print(f"Brain error (idle): {e}")
-        finally:
-            self._brain_busy = False
-        if not comment:
-            comment = random.choice(SAFE_IDLE)
-        if self.window:
-            self.window.bubble_requested.emit(comment)
+            comment = None
+            if self.brain and self.brain.model != "engine_only" and self.brain.available():
+                try:
+                    comment = self.brain.idle_comment(force=True)
+                except Exception as e:
+                    print(f"Brain error (idle): {e}")
+
+            if not comment:
+                comment = random.choice(SAFE_IDLE)
+
+            if self.window:
+                self.window.bubble_requested.emit(comment)
+
+        self.request_queue.put({
+            "type": "ambient_comment",
+            "timestamp": time.time(),
+            "task": task
+        })
 
     # ------------------------------------------------------------ engine tick
     def _tick_engine(self):
@@ -423,23 +484,29 @@ class DesktopPet:
             if is_sleeping:
                 if self.window.animator.current_state != "sleep":
                     self.window.animator.trigger_sleep(force=True)
+                    if self._currently_loaded_model and self._currently_loaded_model != "engine_only":
+                        self.ollama_client.unload_model(self._currently_loaded_model)
             else:
                 if self.window.animator.current_state == "sleep":
-                    self.window.animator.trigger_wake(force=True)
+                    self.window.animator.wake()
 
                 # Behavior gating for physical movement
                 from core.pet_engine import Event
                 event = Event("idle_tick", "system", "Periodic idle tick")
                 gating = self.engine.get_behavior_gating(event)
+                if self.config.get("stay_still", False):
+                    gating["stayStill"] = True
                 if gating["allowMovement"]:
-                    action = self.engine.select_action(gating)
-                    if action != "idle":
-                        trigger_method = f"trigger_{action}"
-                        if hasattr(self.window.animator, trigger_method):
-                            try:
-                                getattr(self.window.animator, trigger_method)(force=True)
-                            except Exception:
-                                pass
+                    # Only select a new action when the pet is currently idle and not moving!
+                    if self.window.animator.current_state == "idle" and not self.window.animator.moving:
+                        action = self.engine.select_action(gating)
+                        if action != "idle":
+                            trigger_method = f"trigger_{action}"
+                            if hasattr(self.window.animator, trigger_method):
+                                try:
+                                    getattr(self.window.animator, trigger_method)(force=True)
+                                except Exception:
+                                    pass
         except Exception as e:
             print(f"Error in engine tick: {e}")
 
@@ -481,6 +548,7 @@ class DesktopPet:
         self.window = DesktopPetWindow()
         self.window.settings_requested.connect(self.open_settings)
         self.window.quit_requested.connect(self.stop)
+        self.window.pet_clicked.connect(self._on_pet_clicked)
         self.apply_runtime_settings()
         self.window.start()
         self.screen_reader.start()  # GUI-thread QTimer; screenshots cached for the brain
@@ -495,6 +563,19 @@ class DesktopPet:
         self._engine_timer.timeout.connect(self._tick_engine)
         self._engine_timer.start()
 
+        # Start Request Queue worker thread
+        self.queue_worker_thread = threading.Thread(target=self._queue_worker_loop, daemon=True)
+        self.queue_worker_thread.start()
+
+        # Run first-run setup after Qt event loop starts
+        QTimer.singleShot(1000, self._check_first_run_setup)
+
+        # Setup periodic system adaptation timer (runs every 15 seconds)
+        self._adaptation_timer = QTimer(self.window)
+        self._adaptation_timer.setInterval(15000)
+        self._adaptation_timer.timeout.connect(self._check_runtime_adaptation)
+        self._adaptation_timer.start()
+
         QTimer.singleShot(8000, self._random_bubble)
 
         monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -503,6 +584,115 @@ class DesktopPet:
         print("Desktop pet is running. Press Ctrl+C to stop.")
         print("Click the pet to shoo it aside; drag it to reposition it.")
         return self.app.exec()
+
+    def _queue_worker_loop(self):
+        while self.is_running:
+            req = self.request_queue.get()
+            if not req:
+                time.sleep(0.1)
+                continue
+            try:
+                req["task"]()
+            except Exception as e:
+                print(f"Error in queue worker task: {e}")
+
+    def _check_first_run_setup(self):
+        """First launch setup wizard to select performance mode and download model."""
+        if not self.engine:
+            return
+
+        perf = self.engine.state.get("performance", {})
+        # If recommendedMode is not set, this is the first run after performance system implementation
+        if not perf.get("recommendedMode"):
+            print("[performance] First-run performance check initiated.")
+            from ui.pet_settings import AIDownloadDialog
+            hw = detect_hardware()
+            rec = recommend_mode_static(hw)
+            
+            with self.engine.lock:
+                perf["recommendedMode"] = rec
+                perf["hardwareSummary"] = hw
+                perf["selectedMode"] = "auto"
+                perf["resolvedMode"] = rec
+                self.engine.state["performance"] = perf
+            self.engine.save_state(immediate=True)
+
+            cfg = PERFORMANCE_MODES.get(rec)
+            if not cfg:
+                return
+                
+            model_name = cfg["model"]
+            if not self.ollama_client.available():
+                QMessageBox.warning(
+                    self.window,
+                    "Ollama Not Running",
+                    "Ollama is not running on localhost:11434.\n"
+                    "Pip will start in Engine-only fallback mode. "
+                    "Make sure Ollama is running and configure the performance tier in Settings."
+                )
+                with self.engine.lock:
+                    self.engine.state["performance"]["resolvedMode"] = "engine_only"
+                self.engine.save_state(immediate=True)
+                return
+
+            if not self.ollama_client.is_model_installed(model_name):
+                # Prompt setup dialog
+                res = QMessageBox.question(
+                    self.window,
+                    "First-Run AI Setup",
+                    f"Welcome to Squish-Mate!\n\n"
+                    f"Based on your system hardware, Pip recommends the '{rec.upper()}' performance tier.\n"
+                    f"To enable local AI, Pip needs to download the model:\n{model_name} (~{cfg['minimumFreeDiskGb'] - 2:.1f} GB)\n\n"
+                    f"Would you like to download it now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if res == QMessageBox.StandardButton.Yes:
+                    from core.pet_performance import ModelManager
+                    model_manager = ModelManager(self.ollama_client)
+                    if not model_manager.check_disk_space_for_model(rec):
+                        QMessageBox.warning(
+                            self.window,
+                            "Disk Space Warning",
+                            "Your home directory might have insufficient disk space. Attempting download anyway."
+                        )
+                    
+                    dlg = AIDownloadDialog(model_manager, model_name, self.window)
+                    if dlg.exec() != QDialog.Accepted:
+                        # Cancelled/failed -> set resolved mode to engine_only
+                        with self.engine.lock:
+                            self.engine.state["performance"]["resolvedMode"] = "engine_only"
+                        self.engine.save_state(immediate=True)
+                else:
+                    # Declined -> set resolved mode to engine_only
+                    with self.engine.lock:
+                        self.engine.state["performance"]["resolvedMode"] = "engine_only"
+                    self.engine.save_state(immediate=True)
+                    QMessageBox.information(
+                        self.window,
+                        "Engine-Only Mode",
+                        "Pip will run in Engine-only mode. You can download models and change performance tiers in Settings at any time."
+                    )
+
+    def _check_runtime_adaptation(self):
+        """Runs periodic system load checks and adapts performance tier under resource pressure."""
+        if not self.engine:
+            return
+        
+        from core.pet_performance import RuntimeAdaptationMonitor
+        monitor = RuntimeAdaptationMonitor(self.engine, self.ollama_client)
+        
+        # Capture old fallback state
+        old_fallback = self.engine.state.get("performance", {}).get("temporaryFallbackState")
+        
+        # Apply adaptation
+        monitor.apply_temporary_adaptation()
+        
+        new_fallback = self.engine.state.get("performance", {}).get("temporaryFallbackState")
+        if old_fallback != new_fallback:
+            if new_fallback:
+                print(f"[adaptation] System resource pressure detected ({new_fallback}). Temporarily downshifting performance tier.")
+            else:
+                print("[adaptation] System resource pressure cleared. Restoring performance tier.")
 
     def stop(self):
         print("Stopping desktop pet...")

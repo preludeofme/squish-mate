@@ -7,7 +7,7 @@ Bypasses activity monitoring entirely so you can confirm fast:
   2. It wanders, breathes, blinks, hops, waves, and bubbles appear.
 
 Run from a graphical desktop terminal:
-    cd ~/Projects/Personal/desktop-pet
+    cd ~/Projects/Personal/squish-mate
     .venv/bin/python test_pet.py
 """
 

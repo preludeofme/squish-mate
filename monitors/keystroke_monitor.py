@@ -49,6 +49,7 @@ class KeystrokeMonitor:
         self._max_chars = max_chars
         self._listener = None
         self._enabled = False
+        self.last_keystroke_time = 0.0
 
     def available(self):
         return _PYNPUT_OK
@@ -60,6 +61,7 @@ class KeystrokeMonitor:
             self._enabled = bool(enabled)
             if not self._enabled:
                 self._buffer.clear()
+                self.last_keystroke_time = 0.0
 
     def start(self):
         """Start the global listener (still a no-op capture-wise until
@@ -84,6 +86,7 @@ class KeystrokeMonitor:
             self._listener = None
         with self._lock:
             self._buffer.clear()
+            self.last_keystroke_time = 0.0
 
     def _on_press(self, key):
         if not self._enabled:
@@ -93,6 +96,7 @@ class KeystrokeMonitor:
         except Exception:
             char = None
         with self._lock:
+            self.last_keystroke_time = time.time()
             if char and char.isprintable():
                 self._buffer.append(char)
             elif key == keyboard.Key.space:
@@ -110,6 +114,10 @@ class KeystrokeMonitor:
     def buffered_length(self):
         with self._lock:
             return len(self._buffer)
+
+    def get_last_keystroke_time(self):
+        with self._lock:
+            return self.last_keystroke_time
 
     def snapshot_and_clear(self):
         """Return the buffered text and IMMEDIATELY wipe it. This is the
