@@ -1,0 +1,33 @@
+{
+  "name": "squish-mate",
+  "version": "0.1.0",
+  "description": "A lightweight desktop pet (Squish-Mate) that monitors user activity and interacts with speech bubbles",
+  "main": "desktop_pet.py",
+  "scripts": {
+    "start": "python3 desktop_pet.py",
+    "monitor": "python3 -m monitors.advanced_monitor"
+  },
+  "keywords": [
+    "squish-mate",
+    "interactive",
+    "system-monitor",
+    "ui",
+    "desktop",
+    "automation"
+  ],
+  "author": "Ryan Buck",
+  "license": "MIT",
+  "dependencies": {
+    "psutil": "^5.9.0",
+    "pyparsing": "^3.0.0",
+    "pywin32": "^305"
+  },
+  "devDependencies": {
+    "python": "^3.8.0",
+    "tkinter": "^8.6.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/preludeofme/squish-mate.git"
+  }
+}
