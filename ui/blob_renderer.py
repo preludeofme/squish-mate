@@ -36,14 +36,57 @@ EYE_COLOR = QColor("#2D1B36")
 BLUSH_COLOR = QColor("#FF9EC4")
 SHADOW_COLOR = QColor(30, 20, 50)
 
+# Body silhouette archetypes — the actual "shape" variety Ryan asked for
+# (color/pattern were already covered separately by the existing color
+# picker + apply_pattern). Every archetype still shares the exact same
+# rig/Pose/animation pipeline (squash-stretch anchor, arm sway from
+# pose.arm_l/r, antenna sway from pose.antenna_sway, etc.) — only the
+# geometry _body_path/_draw_antenna/_draw_horns produce changes, so every
+# pet in the library still hops/waves/sleeps/giggles identically.
+#   w_scale/h_scale — overall body proportions vs. the base round blob.
+#   top_taper       — 1.0 = round top (original); lower = narrower,
+#                      more pointed/teardrop-y top.
+#   arm_reach       — 1.0 = original long thin tentacle reach; lower =
+#                      shorter, stubbier arms.
+#   antenna         — "single" (original) | "twin" | "curly" | "none".
+#   horns           — draw two small nub horns poking out of the top.
+SHAPE_PRESETS = {
+    "round": {
+        "w_scale": 1.00, "h_scale": 1.00, "top_taper": 1.00,
+        "arm_reach": 1.00, "antenna": "single", "horns": False,
+    },
+    "tall": {
+        "w_scale": 0.82, "h_scale": 1.22, "top_taper": 0.85,
+        "arm_reach": 0.85, "antenna": "single", "horns": False,
+    },
+    "wide": {
+        "w_scale": 1.22, "h_scale": 0.82, "top_taper": 1.05,
+        "arm_reach": 1.15, "antenna": "twin", "horns": False,
+    },
+    "teardrop": {
+        "w_scale": 0.92, "h_scale": 1.14, "top_taper": 0.55,
+        "arm_reach": 0.90, "antenna": "curly", "horns": False,
+    },
+    "chubby": {
+        "w_scale": 1.18, "h_scale": 0.92, "top_taper": 1.10,
+        "arm_reach": 0.60, "antenna": "none", "horns": True,
+    },
+    "horned": {
+        "w_scale": 1.00, "h_scale": 1.02, "top_taper": 1.00,
+        "arm_reach": 1.00, "antenna": "single", "horns": True,
+    },
+}
+DEFAULT_SHAPE = "round"
+
 
 class BlobRenderer:
-    BODY_W = 44.0   # body half-width
-    BODY_H = 42.0   # body half-height
+    BASE_W = 44.0   # body half-width at shape "round" (w_scale 1.0)
+    BASE_H = 42.0   # body half-height at shape "round" (h_scale 1.0)
 
     PATTERNS = ("plain", "spots", "stripes", "stars")
 
-    def __init__(self, win_w, win_h, color=DEFAULT_BODY_COLOR, pattern="plain"):
+    def __init__(self, win_w, win_h, color=DEFAULT_BODY_COLOR, pattern="plain",
+                 shape=DEFAULT_SHAPE):
         self.win_w = win_w
         self.win_h = win_h
         self.cx = win_w / 2.0
@@ -53,6 +96,11 @@ class BlobRenderer:
         self.apply_color(color)
         self.pattern = "plain"
         self.apply_pattern(pattern)
+        self.shape = DEFAULT_SHAPE
+        self._shape = SHAPE_PRESETS[DEFAULT_SHAPE]
+        self.BODY_W = self.BASE_W
+        self.BODY_H = self.BASE_H
+        self.apply_shape(shape)
 
     def apply_color(self, hex_str):
         """Recompute the body gradient tones from a single base hex color."""
@@ -66,14 +114,29 @@ class BlobRenderer:
 
     def apply_pattern(self, pattern):
         """Switch the decorative body pattern (see pet_library.py — this is
-        the only other thing besides color that distinguishes a "species").
-        Shape/rig/animations are always identical regardless of pattern."""
+        the color-adjacent, no-shape-change distinguisher a "species" can
+        have alongside apply_shape below)."""
         self.pattern = pattern if pattern in self.PATTERNS else "plain"
+
+    def apply_shape(self, shape):
+        """Switch the body silhouette archetype (see SHAPE_PRESETS above —
+        this is the actual "shape" library, distinct from color/pattern).
+        Every archetype still uses the identical Pose-driven rig/animation
+        pipeline, only the outline/antenna/horn geometry changes."""
+        self.shape = shape if shape in SHAPE_PRESETS else DEFAULT_SHAPE
+        self._shape = SHAPE_PRESETS[self.shape]
+        self.BODY_W = self.BASE_W * self._shape["w_scale"]
+        self.BODY_H = self.BASE_H * self._shape["h_scale"]
 
     # ------------------------------------------------------------------ paths
     def _body_path(self, pose):
-        """One continuous silhouette, arms included, in body-center coords."""
+        """One continuous silhouette, arms included, in body-center coords.
+        `top_taper`/`arm_reach` (from SHAPE_PRESETS) reshape the same curve
+        structure per species — a lower top_taper pulls the shoulders in
+        for a narrower/pointier top, a lower arm_reach shortens the arms."""
         w, h = self.BODY_W, self.BODY_H
+        top = self._shape["top_taper"]
+        reach = self._shape["arm_reach"]
         t = pose.t
         # Small independent wobbles so the outline never scales rigidly.
         w1 = math.sin(t * 1.7) * 1.6
@@ -82,14 +145,20 @@ class BlobRenderer:
         w4 = math.sin(t * 2.9 + 0.5) * 1.2
         arm_r = h * 0.10 + pose.arm_r
         arm_l = h * 0.10 + pose.arm_l
+        # Arm-curve reach multipliers (1.0 == the original fixed constants).
+        a1 = 1.0 + 0.02 * reach
+        a2 = 1.0 + 0.24 * reach
+        a3 = 1.0 + 0.30 * reach
+        a4 = 1.0 + 0.34 * reach
+        a5 = 1.0 + 0.12 * reach
 
         p = QPainterPath(QPointF(0, -h))
-        # Upper-right body curve.
-        p.cubicTo(w * 0.55, -h + w2, w * 0.98 + w1, -h * 0.55,
-                  w * 0.94, -h * 0.12)
+        # Upper-right body curve (top_taper narrows the shoulders).
+        p.cubicTo(w * 0.55 * top, -h + w2, w * 0.98 * top + w1, -h * 0.55,
+                  w * 0.94 * top, -h * 0.12)
         # Right tentacle arm, grown out of the outline.
-        p.cubicTo(w * 1.02, 0, w * 1.24, arm_r - 10, w * 1.30, arm_r)
-        p.cubicTo(w * 1.34, arm_r + 7, w * 1.12, arm_r + 12, w * 0.92, h * 0.40)
+        p.cubicTo(w * a1, 0, w * a2, arm_r - 10, w * a3, arm_r)
+        p.cubicTo(w * a4, arm_r + 7, w * a5, arm_r + 12, w * 0.92, h * 0.40)
         # Lower-right down to a soft wavy bottom.
         p.cubicTo(w * 0.86, h * 0.78, w * 0.55, h * 0.98,
                   w * 0.20, h + w3 * 0.4)
@@ -99,11 +168,11 @@ class BlobRenderer:
         p.cubicTo(-w * 0.55, h * 0.98, -w * 0.86, h * 0.78,
                   -w * 0.92, h * 0.40)
         # Left tentacle arm.
-        p.cubicTo(-w * 1.12, arm_l + 12, -w * 1.34, arm_l + 7,
-                  -w * 1.30, arm_l)
-        p.cubicTo(-w * 1.24, arm_l - 10, -w * 1.02, 0, -w * 0.94, -h * 0.12)
+        p.cubicTo(-w * a5, arm_l + 12, -w * a4, arm_l + 7,
+                  -w * a3, arm_l)
+        p.cubicTo(-w * a2, arm_l - 10, -w * a1, 0, -w * 0.94 * top, -h * 0.12)
         # Upper-left body curve, back to the top.
-        p.cubicTo(-w * 0.98 - w1, -h * 0.55, -w * 0.55, -h + w2, 0, -h)
+        p.cubicTo(-w * 0.98 * top - w1, -h * 0.55, -w * 0.55 * top, -h + w2, 0, -h)
         p.closeSubpath()
         return p
 
@@ -122,7 +191,12 @@ class BlobRenderer:
             # center — rotate here so antenna/body/face all turn together.
             painter.rotate(pose.body_rotation)
 
+        # Antenna/horns are drawn BEFORE the body so the body silhouette
+        # naturally covers their base attachment, leaving only the part
+        # that pokes up above the outline visible.
         self._draw_antenna(painter, pose)
+        if self._shape["horns"]:
+            self._draw_horns(painter, pose)
         body = self._body_path(pose)
         self._draw_body(painter, body, pose)
         self._draw_face(painter, pose)
@@ -133,7 +207,7 @@ class BlobRenderer:
 
     def _draw_shadow(self, painter, pose):
         lift = 1.0 / (1.0 + abs(pose.offset_y) / 30.0)
-        rx = 40.0 * pose.scale_x * (0.6 + 0.4 * lift)
+        rx = 40.0 * (self.BODY_W / self.BASE_W) * pose.scale_x * (0.6 + 0.4 * lift)
         color = QColor(SHADOW_COLOR)
         color.setAlpha(int(60 * lift))
         painter.setPen(Qt.PenStyle.NoPen)
@@ -141,12 +215,35 @@ class BlobRenderer:
         painter.drawEllipse(QPointF(self.cx, self.ground + 7), rx, 7.0)
 
     def _draw_antenna(self, painter, pose):
+        """Dispatches to the antenna style for the current shape archetype
+        (see SHAPE_PRESETS["antenna"])."""
+        style = self._shape["antenna"]
+        if style == "none":
+            return
+        if style == "twin":
+            self._draw_antenna_stalk(painter, pose, x_off=-7.0, sway_scale=0.75,
+                                     height=21.0, pen_width=3.6)
+            self._draw_antenna_stalk(painter, pose, x_off=7.0, sway_scale=0.75,
+                                     height=21.0, pen_width=3.6)
+            return
+        if style == "curly":
+            self._draw_antenna_curly(painter, pose)
+            return
+        self._draw_antenna_stalk(painter, pose)
+
+    def _draw_antenna_stalk(self, painter, pose, x_off=0.0, sway_scale=1.0,
+                             height=30.0, pen_width=4.5):
+        """The original bendy-antenna-with-glowing-bulb, parametrized so it
+        can be drawn once (single) or twice, offset/shortened (twin)."""
         h = self.BODY_H
-        sway = pose.antenna_sway
-        tip = QPointF(sway, -h - 30)
-        path = QPainterPath(QPointF(0, -h + 4))
-        path.cubicTo(sway * 0.15, -h - 10, sway * 0.55, -h - 21, tip.x(), tip.y())
-        pen = QPen(self.BODY_EDGE, 4.5, Qt.PenStyle.SolidLine,
+        sway = pose.antenna_sway * sway_scale
+        base = QPointF(x_off, -h + 4)
+        tip = QPointF(x_off + sway, -h - height)
+        path = QPainterPath(base)
+        path.cubicTo(x_off + sway * 0.15, -h - height * 0.33,
+                     x_off + sway * 0.55, -h - height * 0.70,
+                     tip.x(), tip.y())
+        pen = QPen(self.BODY_EDGE, pen_width, Qt.PenStyle.SolidLine,
                    Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -159,6 +256,40 @@ class BlobRenderer:
         painter.setPen(QPen(self.BODY_EDGE, 1.2))
         painter.setBrush(bulb)
         painter.drawEllipse(tip, 5.0, 5.0)
+
+    def _draw_antenna_curly(self, painter, pose):
+        """A stem that curls into a small spiral loop instead of ending in
+        a glowing bulb — used by the "teardrop" shape archetype."""
+        h = self.BODY_H
+        sway = pose.antenna_sway
+        base = QPointF(0, -h + 4)
+        mid = QPointF(sway * 0.4, -h - 16)
+        path = QPainterPath(base)
+        path.cubicTo(sway * 0.15, -h - 8, sway * 0.4, -h - 14, mid.x(), mid.y())
+        path.cubicTo(mid.x() + 7, mid.y() - 4, mid.x() + 7, mid.y() + 6,
+                     mid.x(), mid.y() + 6)
+        path.cubicTo(mid.x() - 5, mid.y() + 6, mid.x() - 3, mid.y() - 2,
+                     mid.x() + 1, mid.y() - 1)
+        pen = QPen(self.BODY_EDGE, 4.0, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+    def _draw_horns(self, painter, pose):
+        """Two small nub horns poking out of the top of the body — used by
+        shape archetypes with SHAPE_PRESETS["horns"] = True."""
+        h, w = self.BODY_H, self.BODY_W
+        for side in (-1, 1):
+            base = QPointF(side * w * 0.32, -h * 0.88)
+            tip = QPointF(side * w * 0.40, -h * 1.22)
+            path = QPainterPath(QPointF(base.x() - side * 3.5, base.y()))
+            path.lineTo(tip)
+            path.lineTo(QPointF(base.x() + side * 3.5, base.y()))
+            path.closeSubpath()
+            painter.setPen(QPen(self.BODY_EDGE, 1.4))
+            painter.setBrush(self.BODY_MID)
+            painter.drawPath(path)
 
     def _draw_body(self, painter, body, pose):
         w, h = self.BODY_W, self.BODY_H

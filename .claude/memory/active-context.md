@@ -756,3 +756,81 @@ exactly as-is). Only covers the three opt-in hosted alternatives:
   persisted state.
 - Needs Ryan to restart `desktop_pet.py` to pick any of this up, and to
   supply a real API key in Settings to actually exercise a hosted provider.
+
+## Pet library follow-up: actual body-SHAPE variety, not just color/pattern (2026-07-17, same day)
+Ryan: he already has a color changer in Settings, and was looking for the
+"Change Pet" library to vary actual pet *shape* more than color/decals
+(though he does like the pattern decals). The first pass only varied
+color+pattern on an identical silhouette — this pass adds real geometry
+variety while keeping every pet using the exact same rig/animation
+pipeline (Pose fields, PetAnimator states, squash-stretch anchor all
+untouched; only `blob_renderer.py`'s path-drawing math changed).
+- `blob_renderer.py`: new `SHAPE_PRESETS` dict (6 archetypes: round/tall/
+  wide/teardrop/chubby/horned) + `DEFAULT_SHAPE = "round"`. Each preset is
+  `{w_scale, h_scale, top_taper, arm_reach, antenna, horns}`. Class
+  constants renamed `BODY_W/BODY_H` (44.0/42.0) → `BASE_W/BASE_H`; the
+  *effective* `self.BODY_W`/`self.BODY_H` are now instance attributes set
+  by new `apply_shape(shape)` (`BASE_* × w_scale/h_scale`) — every other
+  method already referenced `self.BODY_W`/`self.BODY_H`, so no other call
+  sites needed touching once this was instance-level.
+- `_body_path()` (the single continuous Bézier silhouette+arms outline)
+  parametrized by `top_taper` (scales the upper-curve control-point
+  multipliers 0.55/0.98/0.94 → narrower/pointier top when < 1.0) and
+  `arm_reach` (scales the arm-curve reach multipliers 1.02/1.24/1.30/1.34/
+  1.12, derived as `1.0 + fixed_offset * reach` so `reach=1.0` reproduces
+  the exact original curve bit-for-bit — verified no visual regression for
+  the "round" default).
+- `_draw_antenna` is now a style dispatcher (`SHAPE_PRESETS[...]["antenna"]`):
+  "single" (original bendy-stalk-with-glowing-bulb, now
+  `_draw_antenna_stalk(x_off, sway_scale, height, pen_width)` so it's
+  reusable), "twin" (two shorter/thinner stalks offset ±7px), "curly" (new
+  `_draw_antenna_curly` — stem curls into a small spiral loop instead of a
+  bulb), "none" (skipped entirely, e.g. "chubby").
+- New `_draw_horns()` — two small triangular nub horns poking from the top
+  of the body, drawn (like the antenna) BEFORE the body silhouette so the
+  body naturally covers their base and only the tip pokes out above the
+  outline. Gated by `SHAPE_PRESETS[...]["horns"]`.
+- `_draw_shadow`'s ground-shadow radius now scales with
+  `self.BODY_W / self.BASE_W` so wide/chubby pets cast a proportionally
+  wider shadow instead of a fixed 40px regardless of actual body width.
+- `core/pet_library.py`: every entry gained a `"shape"` key mapped to fit
+  its flavor (mochi→wide+twin-antenna "mochi squish", kelp→tall, ember→
+  teardrop+curly-antenna "flame", nocturne→horned+stars, coral→chubby,
+  pip/honeydew stay "round" — pip explicitly kept as the unmodified
+  original). `pet_window.py` `apply_settings()` now also calls
+  `renderer.apply_shape(config.get("shape","round"))`;
+  `desktop_pet.py`'s `default_config` gained `"shape": "round"` and
+  `open_change_pet()` now sets `config["shape"]` alongside color/pattern
+  when a species is picked.
+- Deliberately did NOT touch the existing Settings color picker or make
+  species-picking skip setting color/pattern — picking a pet from the
+  library is still a themed "starting point" preset (shape+color+pattern
+  together); the user's separate Settings color picker still works
+  identically afterward to fine-tune just the color if they don't like a
+  species' default hue, exactly as before this change.
+- Verified offscreen: all 6 shape archetypes render error-free through a
+  full `BlobRenderer.draw()` + several `PetAnimator` update ticks
+  (including mid-wave), `BODY_W`/`BODY_H` compute correctly per preset, an
+  unknown shape id falls back to "round", and a full `DesktopPet`
+  (scratch config) round-trip through `open_change_pet`'s underlying logic
+  correctly swaps `renderer.shape`/`BODY_W`/`BODY_H` live across 4
+  different species. All 24 existing tests still pass.
+- Needs Ryan to restart `desktop_pet.py` and try Change Pet… on the real
+  display — this is a fair amount of new Bézier math that's only been
+  verified for "renders without throwing", not eyeballed for how good each
+  silhouette actually looks live.
+
+## Android support plan written (2026-07-17)
+Ryan asked for a full plan to add Android support (modify vs. new codebase).
+Wrote `docs/android_plan.md` — recommendation: separate Kotlin app repo
+(`squish-mate-android`) that reuses the existing pure-Python `core/` package
+unmodified via Chaquopy embedding; rendering/animator get native Kotlin
+ports (high-frequency path stays off the bridge), engine/brain/LLM stay
+Python behind a new JSON facade `core/bridge.py` (Phase 0, in this repo).
+Key findings baked into the plan: `core/` has zero Qt imports (grep-verified)
+but `pet_engine.py:36` hardcodes `~/.config/squish-mate` paths (needs
+storage-dir injection); `llm_providers.py` hosted providers are the v1
+Android LLM path (no on-device Ollama); Android monitors are necessarily
+shallower (UsageStats package-only, no titles; keystroke monitor dropped).
+Supersedes the older `squish-mate_split_plan.md` multi-repo split — plan
+says don't split repos yet. No code changed.

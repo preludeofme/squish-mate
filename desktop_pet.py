@@ -157,6 +157,7 @@ class DesktopPet:
             # every animation are identical across all pets.
             "pet_species": "pip",
             "pattern": "plain",
+            "shape": "round",
             "personality_traits": [],
             "initial_prompt": "",
             "move_frequency": "normal",
@@ -257,6 +258,7 @@ class DesktopPet:
             self.config["pet_species"] = species["id"]
             self.config["color"] = species["color"]
             self.config["pattern"] = species["pattern"]
+            self.config["shape"] = species["shape"]
             self.save_config()
             self.apply_runtime_settings()
             if self.window:

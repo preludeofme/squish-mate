@@ -1,5 +1,5 @@
 ## Tasks / Ideas
-- [x] add ability to change pets (but overall shape/style should remain the same such as they should all be "squishy" in some way)
+- [ ] add ability to change pets (but overall style should remain the same such as they should all be "squishy" in some way)
     - [x] Add a ui element to be able to change pets
     - [x] Add a library of pets to be able to switch between
     - [x] make sure all pets have the same functionality (animations, etc.)

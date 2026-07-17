@@ -208,6 +208,7 @@ class DesktopPetWindow(QWidget):
         if color:
             self.renderer.apply_color(color)
         self.renderer.apply_pattern(config.get("pattern", "plain"))
+        self.renderer.apply_shape(config.get("shape", "round"))
         ranges = MOVE_FREQUENCY_PRESETS.get(
             config.get("move_frequency", "normal"), MOVE_FREQUENCY_PRESETS["normal"])
         self.animator.set_frequencies(

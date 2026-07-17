@@ -2,11 +2,17 @@
 """
 pet_library.py — the library of selectable pet "species".
 
-Per Ryan's spec: every pet in the library keeps the exact same squishy blob
-shape/rig/animations (BlobRenderer + PetAnimator are completely unchanged,
-so hop/wave/sleep/giggle/etc. all work identically for every entry) — only
-the body color and a light decorative pattern differ. Adding a new species
-here means adding a new dict entry, nothing else.
+Per Ryan's spec: every pet in the library keeps the exact same squishy
+rig/animation pipeline (BlobRenderer + PetAnimator are unchanged — hop/
+wave/sleep/giggle/etc. all work identically for every entry, driven by the
+same Pose fields). What actually varies per species now:
+  - "shape"   — body silhouette archetype (see ui/blob_renderer.SHAPE_PRESETS:
+                proportions, top taper, arm reach, antenna style, horns).
+                This is the main visual differentiator Ryan asked for.
+  - "color"   — base body hex (also independently editable via the existing
+                Settings color picker, so this is just each species' default).
+  - "pattern" — light decorative overlay (spots/stripes/stars/plain).
+Adding a new species here means adding a new dict entry, nothing else.
 """
 
 PET_LIBRARY = [
@@ -14,41 +20,47 @@ PET_LIBRARY = [
         "id": "pip",
         "name": "Pip",
         "color": "#C9A5F0",
+        "shape": "round",
         "pattern": "plain",
-        "blurb": "The original lavender blob.",
+        "blurb": "The original round lavender blob.",
     },
     {
         "id": "mochi",
         "name": "Mochi",
         "color": "#FFC9DE",
+        "shape": "wide",
         "pattern": "spots",
-        "blurb": "A bubblegum-pink blob with playful spots.",
+        "blurb": "A squashed, bubblegum-pink mochi blob with twin antennae.",
     },
     {
         "id": "kelp",
         "name": "Kelp",
         "color": "#8FE3B0",
+        "shape": "tall",
         "pattern": "stripes",
-        "blurb": "A minty green blob with tide-pool stripes.",
+        "blurb": "A tall, narrow minty-green blob with tide-pool stripes.",
     },
     {
         "id": "ember",
         "name": "Ember",
         "color": "#FFA36B",
+        "shape": "teardrop",
         "pattern": "spots",
-        "blurb": "A warm orange blob, freckled like embers.",
+        "blurb": "A flame-shaped teardrop blob with a curly antenna.",
     },
     {
         "id": "nocturne",
         "name": "Nocturne",
         "color": "#6B7FE3",
+        "shape": "horned",
         "pattern": "stars",
-        "blurb": "A deep indigo blob dusted with tiny stars.",
+        "blurb": "A deep indigo blob with little horns, dusted with stars.",
     },
     {
         "id": "honeydew",
         "name": "Honeydew",
         "color": "#D9E36B",
+        "shape": "round",
         "pattern": "plain",
         "blurb": "A cheerful chartreuse blob, plain and bright.",
     },
@@ -56,8 +68,9 @@ PET_LIBRARY = [
         "id": "coral",
         "name": "Coral",
         "color": "#FF7F7F",
+        "shape": "chubby",
         "pattern": "stripes",
-        "blurb": "A sunny coral-red blob with reef-like stripes.",
+        "blurb": "A round, chubby coral-red blob with tiny reef horns.",
     },
 ]
 
