@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import com.preludeofme.squishmate.MainActivity
 import com.preludeofme.squishmate.R
 import com.preludeofme.squishmate.bridge.PetBridge
+import com.preludeofme.squishmate.monitor.DeviceEventMonitor
 import com.preludeofme.squishmate.monitor.UsageMonitor
 import com.preludeofme.squishmate.settings.MessageFrequency
 import com.preludeofme.squishmate.settings.PetSettingsStore
@@ -44,6 +45,14 @@ import kotlin.random.Random
  * `PetBridge.onActivity`/`idleComment` can block on network. UI mutations
  * (adding the view, moving it, redrawing, feeding a tick snapshot into the
  * animator) stay on the main thread via [uiHandler].
+ *
+ * [deviceEventMonitor] ([DeviceEventMonitor], Phase 4) feeds Android-only
+ * context (battery low, charger plugged/unplugged, headphones) into the
+ * same [PetBridge.onActivity] path as [maybeCheckForegroundApp]. Both, plus
+ * [maybeTriggerIdleComment], are suppressed for a short window after a drag
+ * or a screen unlock ([isRecentlyDistracted]) — the mobile equivalent of
+ * desktop's typing-suppression: a user who just touched the pet or just
+ * unlocked their phone doesn't want it immediately talking over them.
  */
 class OverlayService : Service(), PetView.Listener {
 
@@ -62,12 +71,18 @@ class OverlayService : Service(), PetView.Listener {
     private var lastIdleAttemptMs = 0L
     private var lastForegroundCheckMs = 0L
     private var lastForegroundPackage: String? = null
+    private var lastDragMs = 0L
+    private var lastScreenOnMs = 0L
+    private lateinit var deviceEventMonitor: DeviceEventMonitor
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 Intent.ACTION_SCREEN_OFF -> stopTicking()
-                Intent.ACTION_SCREEN_ON -> startTicking()
+                Intent.ACTION_SCREEN_ON -> {
+                    lastScreenOnMs = System.currentTimeMillis()
+                    startTicking()
+                }
                 PetSettingsStore.ACTION_CONFIG_UPDATED -> reloadConfig()
             }
         }
@@ -109,6 +124,12 @@ class OverlayService : Service(), PetView.Listener {
                 Log.e(TAG, "PetBridge.init failed", e)
             }
         }
+        deviceEventMonitor = DeviceEventMonitor(this) { activeApp, source, reason ->
+            val now = System.currentTimeMillis()
+            if (isRecentlyDistracted(now)) return@DeviceEventMonitor
+            reactToActivity(activeApp, source, reason)
+        }
+        deviceEventMonitor.start()
         startTicking()
     }
 
@@ -134,6 +155,9 @@ class OverlayService : Service(), PetView.Listener {
     override fun onDestroy() {
         isRunning = false
         stopTicking()
+        if (::deviceEventMonitor.isInitialized) {
+            deviceEventMonitor.stop()
+        }
         try {
             unregisterReceiver(screenReceiver)
         } catch (e: IllegalArgumentException) {
@@ -245,6 +269,7 @@ class OverlayService : Service(), PetView.Listener {
     }
 
     override fun onDragBy(dxPx: Int, dyPx: Int) {
+        lastDragMs = System.currentTimeMillis()
         layoutParams.x += dxPx
         layoutParams.y += dyPx
         uiHandler.post {
@@ -310,6 +335,7 @@ class OverlayService : Service(), PetView.Listener {
     private fun maybeCheckForegroundApp(now: Long) {
         if (now - lastForegroundCheckMs < FOREGROUND_CHECK_INTERVAL_MS) return
         lastForegroundCheckMs = now
+        if (isRecentlyDistracted(now)) return
         workerHandler.post {
             try {
                 if (!UsageMonitor.hasPermission(this)) return@post
@@ -317,19 +343,46 @@ class OverlayService : Service(), PetView.Listener {
                 if (pkg == packageName || pkg == lastForegroundPackage) return@post
                 lastForegroundPackage = pkg
                 val label = UsageMonitor.appLabel(this, pkg)
-                val snapshot = PetBridge.onActivity(label, null, pkg, "app switch")
-                uiHandler.post {
-                    if (::petView.isInitialized) {
-                        petView.applyEngineSnapshot(snapshot.emotion, snapshot.action, snapshot.sleeping)
-                    }
-                    val text = snapshot.speech
-                    if (!text.isNullOrBlank()) showBubble(text)
-                }
+                reactToActivity(label, pkg, "app switch")
             } catch (e: Exception) {
                 Log.e(TAG, "onActivity failed", e)
             }
         }
     }
+
+    /**
+     * Shared `PetBridge.onActivity` call site for both real app-switch
+     * context ([maybeCheckForegroundApp]) and Android-only device events
+     * ([deviceEventMonitor]) — must be called on [workerHandler].
+     */
+    private fun reactToActivity(activeApp: String, processName: String, reason: String) {
+        try {
+            Log.d(TAG, "reactToActivity: reason=\"$reason\" activeApp=\"$activeApp\"")
+            val snapshot = PetBridge.onActivity(activeApp, null, processName, reason)
+            uiHandler.post {
+                if (::petView.isInitialized) {
+                    petView.applyEngineSnapshot(snapshot.emotion, snapshot.action, snapshot.sleeping)
+                }
+                val text = snapshot.speech
+                if (!text.isNullOrBlank()) showBubble(text)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "onActivity($reason) failed", e)
+        }
+    }
+
+    /**
+     * True for a short window after the pet was dragged or the screen was
+     * just turned on — the mobile analogue of desktop's typing-suppression
+     * (docs/android_plan.md §7 Phase 4: "suppress speech ... while pet was
+     * recently dragged / screen just unlocked", since there's no mobile
+     * equivalent of "user is actively typing"). Gates
+     * [maybeCheckForegroundApp], [maybeTriggerIdleComment], and
+     * [deviceEventMonitor]'s callback — but never the direct-touch
+     * reactions in [onInteraction], which should always fire immediately.
+     */
+    private fun isRecentlyDistracted(now: Long): Boolean =
+        now - lastDragMs < SUPPRESS_AFTER_DRAG_MS || now - lastScreenOnMs < SUPPRESS_AFTER_SCREEN_ON_MS
 
     /**
      * Periodic ambient chatter (the bridge equivalent of desktop's
@@ -344,6 +397,7 @@ class OverlayService : Service(), PetView.Listener {
     private fun maybeTriggerIdleComment(now: Long) {
         if (now - lastIdleAttemptMs < IDLE_COMMENT_INTERVAL_MS) return
         lastIdleAttemptMs = now
+        if (isRecentlyDistracted(now)) return
         val prob = MessageFrequency.idleProb(PetSettingsStore.load(this).messageFrequency)
         if (Random.nextDouble() > prob) return
         workerHandler.post {
@@ -402,6 +456,10 @@ class OverlayService : Service(), PetView.Listener {
         // Plan §5.3 recommends polling UsageStats every 3-5s; piggybacked
         // on the 2s tick loop's own cadence rather than a separate timer.
         private const val FOREGROUND_CHECK_INTERVAL_MS = 4_000L
+        // Mobile equivalent of desktop's typing-suppression window — see
+        // isRecentlyDistracted's doc comment.
+        private const val SUPPRESS_AFTER_DRAG_MS = 5_000L
+        private const val SUPPRESS_AFTER_SCREEN_ON_MS = 3_000L
 
         /** True while this service owns the `PetBridge` session (between
          * `onCreate`/`onDestroy`). `PetBridge`'s Python-side session is a

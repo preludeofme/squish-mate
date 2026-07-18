@@ -6,19 +6,42 @@ floating desktop pet. This directory lives inside the main squish-mate repo
 [`../docs/android_plan.md`](../docs/android_plan.md) for the full
 architecture, rationale, and phased plan this app is being built against.
 
-**Status: Phase 3 done, Phase 4 started.** The real Bézier-blob
-renderer/animator (Phase 2) drives the overlay, a `SpeechBubbleView`
-overlay window shows what the pet says, a Settings screen feeds
-name/persona/message-frequency/LLM-provider config (including a live LAN
-Ollama URL override) into `PetBridge`, and denying/skipping the overlay
-permission no longer strands the pet — `MainActivity` can embed the same
-`PetView` in-app instead (mutually exclusive with the floating overlay).
-The pet now actually talks: periodic ambient chatter (`PetBridge.idleComment`)
-runs on both the overlay and the in-app fallback, and an opt-in
-`UsageStatsManager`-based `UsageMonitor` (Phase 4, minimal) feeds real
-app-switch context into `PetBridge.onActivity`. Still open: battery-event
-context sources, and a first real emulator/device smoke test (nothing in
-this app has been visually verified on an actual screen yet).
+**Status: Phases 0-4 done, Phase 5 (hardening/release) underway.** The real
+Bézier-blob renderer/animator (Phase 2) drives the overlay, a
+`SpeechBubbleView` overlay window shows what the pet says, a Settings
+screen feeds name/persona/message-frequency/LLM-provider config (including
+a live LAN Ollama URL override) into `PetBridge`, and denying/skipping the
+overlay permission no longer strands the pet — `MainActivity` can embed
+the same `PetView` in-app instead (mutually exclusive with the floating
+overlay). The pet talks: periodic ambient chatter
+(`PetBridge.idleComment`) runs on both the overlay and the in-app
+fallback, an opt-in `UsageStatsManager`-based `UsageMonitor` feeds real
+app-switch context into `PetBridge.onActivity`, and `DeviceEventMonitor`
+(no permission needed) reports battery-low/charger-connect-disconnect/
+headphone-plug transitions the same way, with a short post-drag/
+post-screen-unlock speech-suppression window (`OverlayService.
+isRecentlyDistracted`). Live-verified end to end on a Pixel 6 emulator
+(API 34): cold start (service start → first successful engine tick)
+measures ~1.7s, well under the `docs/android_plan.md` §10 3s escape-hatch
+threshold; screen-off/on correctly pauses/resumes the tick loop; a
+force-stop mid-session and relaunch reload state cleanly via the engine's
+existing offline-elapsed simulation with no crash; battery/charging
+transitions were confirmed firing via `dumpsys battery` (a real bug —
+`ACTION_BATTERY_CHANGED` racing `ACTION_POWER_DISCONNECTED` and silently
+swallowing the disconnect event — was caught and fixed this way).
+`release` now builds with R8 + resource shrinking on (`isMinifyEnabled =
+true`), verified crash-free on-device including the Settings screen's
+Keystore-backed `EncryptedSharedPreferences` path (23MB release vs 29MB
+debug APK, both far under the §10 threshold) — **the release
+`signingConfig` currently reuses the debug keystore for this local testing
+only and must be replaced before any real distribution.** A draft of the
+Play Store data-safety/permission declarations lives at
+`../docs/play_store_declarations.md`. Still open (rest of Phase 5):
+real-hardware (non-emulator) testing, especially OEM background-killer
+behavior (Samsung/Xiaomi) and a full multi-hour Battery Historian pass;
+headphone-plug events are code-reviewed but not live-tested (the emulator
+can't simulate `ACTION_HEADSET_PLUG`, a protected broadcast); a real
+release signing config and GitHub release packaging.
 
 ## Architecture in one line
 
@@ -69,8 +92,8 @@ app/src/main/java/com/preludeofme/squishmate/
 ├── bridge/    PetBridge — the only Kotlin class that talks to Python (core.bridge)
 ├── anim/      PetAnimator port (Phase 2)
 ├── render/    BlobRenderer Canvas port (Phase 2)
-├── monitor/   UsageMonitor — opt-in UsageStatsManager foreground-app polling (Phase 4,
-│              battery/charging events still not started)
+├── monitor/   UsageMonitor (opt-in UsageStatsManager foreground-app polling) +
+│              DeviceEventMonitor (no-permission battery/charging/headphone events)
 ├── settings/  PetSettingsStore (EncryptedSharedPreferences), SettingsActivity,
 │              MessageFrequency (idle-chatter probability, mirrors core/bridge.py)
 └── MainActivity.kt   onboarding + permission flows + in-app fallback PetView

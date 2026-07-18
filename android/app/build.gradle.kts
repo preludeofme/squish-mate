@@ -30,8 +30,26 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Phase 5 APK-size check (docs/android_plan.md §7/§10): R8
+            // shrinking of the Kotlin/Java side. Safe by default here
+            // because nothing in this app is called reflectively — Python
+            // only ever receives calls FROM Kotlin (PetBridge -> core.bridge),
+            // never the reverse, so there are no Kotlin classes Python
+            // needs to find by name/reflection that R8 could rename/strip.
+            // See proguard-rules.pro for the one Chaquopy-specific note.
+            // Does NOT shrink Chaquopy's own payload (Python interpreter +
+            // stdlib + core/), which is the dominant contributor to APK
+            // size for this app — that's tracked separately per §4 item 4.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // TEMPORARY, Phase 5 testing only: reuses the debug keystore so
+            // this variant is installable on a dev device/emulator to
+            // sanity-check R8 didn't break anything at runtime. MUST be
+            // replaced with a real release signing config (see
+            // docs/android_plan.md §7 Phase 5 "GitHub release APK") before
+            // any build leaves this machine.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
