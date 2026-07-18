@@ -43,6 +43,18 @@ cd squish-mate
 
 On Linux/macOS:
 ```bash
+./install.sh
+```
+
+On Windows (PowerShell):
+```powershell
+.\install.ps1
+```
+
+Each script creates a `.venv`, installs the required Python packages, and (on Linux) offers to install `xdotool`/`wmctrl` via your package manager. You can still do it by hand if you prefer:
+
+On Linux/macOS:
+```bash
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install PySide6 psutil requests pynput Pillow
 ```
@@ -133,7 +145,7 @@ The project is designed to be:
 
 Special thanks to [@OminousIndustries](https://github.com/OminousIndustries) for the videos and ideas from their [YouTube Channel](https://www.youtube.com/@Bijanbowen). 
 
-This project was inspired by their video: [Building a Desktop Pet with Python](https://youtu.be/xPcZ0w3ouo8?si=nysdiIYYvS_xKale&t=308).
+This project was inspired by their video: [Kimi K3](https://youtu.be/xPcZ0w3ouo8?si=nysdiIYYvS_xKale&t=308).
 
 ## Contributing
 
