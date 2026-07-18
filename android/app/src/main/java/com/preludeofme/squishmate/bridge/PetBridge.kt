@@ -2,6 +2,7 @@ package com.preludeofme.squishmate.bridge
 
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
+import com.preludeofme.squishmate.llm.OnDeviceEngine
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -53,6 +54,20 @@ object PetBridge {
 
     fun updateConfig(configJson: String) {
         module.callAttr("update_config", configJson)
+    }
+
+    /**
+     * Registers/clears the on-device provider's text-generation callback
+     * (docs/android_plan.md §5.4 item 3 — provider "ondevice"). Chaquopy
+     * lets Python call [OnDeviceEngine]'s `generate(system, user, maxTokens)`
+     * method directly (`core/bridge.py`'s `set_ondevice_generator`), so
+     * [OnDeviceEngine] itself is passed as-is — no separate wrapper class
+     * needed, its method name/signature already match what
+     * `core/pet_brain.py._chat_ondevice` expects. Pass null to clear it
+     * (e.g. the model failed to load, or the user switched providers).
+     */
+    fun setOnDeviceGenerator(generator: OnDeviceEngine?) {
+        module.callAttr("set_ondevice_generator", generator)
     }
 
     fun tick(nowMs: Long): Snapshot =

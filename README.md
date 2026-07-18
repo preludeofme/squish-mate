@@ -40,16 +40,32 @@ cd squish-mate
 ```
 
 2. Install dependencies:
+
+On Linux/macOS:
 ```bash
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install PySide6 psutil requests pynput Pillow
 ```
 
+On Windows:
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install PySide6 psutil requests pynput Pillow pywin32
+```
+
 3. Run Squish-Mate:
+
+On Linux/macOS:
 ```bash
 ./run_pet.sh
 # or: .venv/bin/python desktop_pet.py
-# or: python3 run_pet.py  (auto-uses .venv if present)
+# or: python3 run_pet.py
+```
+
+On Windows:
+```powershell
+python desktop_pet.py
 ```
 
 ## Usage
@@ -113,15 +129,11 @@ The project is designed to be:
 - Easy to extend with new app types
 - Cross-platform compatible
 
-## Support
+## Credits & Inspiration
 
-If you enjoy using Squish-Mate, please consider supporting its development!
+Special thanks to [@OminousIndustries](https://github.com/OminousIndustries) for the videos and ideas from their [YouTube Channel](https://www.youtube.com/@Bijanbowen). 
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-orange?style=flat-square&logo=buy-me-a-coffee)](https://buymeacoffee.com/preludeofme)
-
-## License
-
-MIT License - see LICENSE for details.
+This project was inspired by their video: [Building a Desktop Pet with Python](https://youtu.be/xPcZ0w3ouo8?si=nysdiIYYvS_xKale&t=308).
 
 ## Contributing
 
@@ -138,3 +150,7 @@ Contributions are welcome! Please follow these steps:
 If you enjoy using Squish-Mate, please consider supporting its development!
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-orange?style=flat-square&logo=buy-me-a-coffee)](https://buymeacoffee.com/preludeofme)
+
+## License
+
+MIT License - see LICENSE for details.

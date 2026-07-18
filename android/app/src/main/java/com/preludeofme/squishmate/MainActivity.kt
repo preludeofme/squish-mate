@@ -19,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.preludeofme.squishmate.bridge.PetBridge
 import com.preludeofme.squishmate.databinding.ActivityMainBinding
+import com.preludeofme.squishmate.llm.OnDeviceEngine
 import com.preludeofme.squishmate.monitor.UsageMonitor
 import com.preludeofme.squishmate.overlay.OverlayService
 import com.preludeofme.squishmate.overlay.PetView
@@ -228,8 +229,31 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "in-app PetBridge.init failed", e)
             }
+            ensureOnDeviceModelState(PetSettingsStore.load(this).llmProvider)
         }
         uiHandler.post(inAppTickRunnable)
+    }
+
+    /** Same on-device-model load/unload logic as `OverlayService`'s own
+     * copy — see its doc comment. Duplicated rather than shared because
+     * this Activity and that Service already duplicate the rest of their
+     * bridge-driving logic (tick loop, idle comment) for the same reason:
+     * they're mutually exclusive drivers of a single `PetBridge` session,
+     * not variations of a shared component. */
+    private fun ensureOnDeviceModelState(provider: String) {
+        val engine = OnDeviceEngine.getInstance(this)
+        if (provider == "ondevice") {
+            if (engine.isModelLoaded) return
+            val modelFile = OnDeviceEngine.modelFile(this)
+            if (engine.loadModel(modelFile.absolutePath)) {
+                PetBridge.setOnDeviceGenerator(engine)
+            } else {
+                Log.e(TAG, "On-device model failed to load from ${modelFile.absolutePath}")
+            }
+        } else if (engine.isModelLoaded) {
+            PetBridge.setOnDeviceGenerator(null)
+            engine.unload()
+        }
     }
 
     /** Stops ticking + shuts down the shared bridge session; safe to call
@@ -245,6 +269,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "in-app PetBridge.shutdown failed", e)
             }
+            OnDeviceEngine.getInstance(this).unload()
         }
         workerThread?.quitSafely()
         workerThread = null

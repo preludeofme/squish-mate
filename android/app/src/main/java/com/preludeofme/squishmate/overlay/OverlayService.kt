@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import com.preludeofme.squishmate.MainActivity
 import com.preludeofme.squishmate.R
 import com.preludeofme.squishmate.bridge.PetBridge
+import com.preludeofme.squishmate.llm.OnDeviceEngine
 import com.preludeofme.squishmate.monitor.DeviceEventMonitor
 import com.preludeofme.squishmate.monitor.UsageMonitor
 import com.preludeofme.squishmate.settings.MessageFrequency
@@ -123,6 +124,7 @@ class OverlayService : Service(), PetView.Listener {
             } catch (e: Exception) {
                 Log.e(TAG, "PetBridge.init failed", e)
             }
+            ensureOnDeviceModelState(PetSettingsStore.load(this).llmProvider)
         }
         deviceEventMonitor = DeviceEventMonitor(this) { activeApp, source, reason ->
             val now = System.currentTimeMillis()
@@ -145,6 +147,36 @@ class OverlayService : Service(), PetView.Listener {
             } catch (e: Exception) {
                 Log.e(TAG, "PetBridge.updateConfig failed", e)
             }
+            ensureOnDeviceModelState(PetSettingsStore.load(this).llmProvider)
+        }
+    }
+
+    /**
+     * Loads/unloads [OnDeviceEngine]'s ~3GB Gemma model to match the
+     * currently configured provider (docs/android_plan.md §5.4 item 3) —
+     * called after every `PetBridge.init`/`updateConfig`, on [workerHandler]
+     * only (model load is slow, seconds). Deliberately conservative with
+     * RAM: only loaded while `provider == "ondevice"` is actually selected,
+     * unloaded the moment it isn't (including in [onDestroy]) rather than
+     * kept warm "just in case" — matches the plan's opt-in-only posture for
+     * every other heavy/battery-relevant feature in this app (Usage Access,
+     * device events, etc.).
+     */
+    private fun ensureOnDeviceModelState(provider: String) {
+        val engine = OnDeviceEngine.getInstance(this)
+        if (provider == "ondevice") {
+            if (engine.isModelLoaded) return
+            val modelFile = OnDeviceEngine.modelFile(this)
+            if (engine.loadModel(modelFile.absolutePath)) {
+                PetBridge.setOnDeviceGenerator(engine)
+            } else {
+                Log.e(TAG, "On-device model failed to load from ${modelFile.absolutePath} " +
+                    "— provider 'ondevice' will fall back to SAFE_FALLBACKS lines until a " +
+                    "valid ${OnDeviceEngine.MODEL_FILENAME} is present there.")
+            }
+        } else if (engine.isModelLoaded) {
+            PetBridge.setOnDeviceGenerator(null)
+            engine.unload()
         }
     }
 
@@ -175,6 +207,7 @@ class OverlayService : Service(), PetView.Listener {
             } catch (e: Exception) {
                 Log.e(TAG, "PetBridge.shutdown failed", e)
             }
+            OnDeviceEngine.getInstance(this).unload()
             workerThread.quitSafely()
         }
         super.onDestroy()

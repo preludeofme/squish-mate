@@ -77,6 +77,11 @@ class _Session:
         self.memory = None
         self.pet_config = dict(DEFAULT_PET_CONFIG)
         self.last_tick_ms = None
+        # Survives across init() (a session reset re-creates `brain`, but
+        # the host's registered on-device callback — e.g. Android's loaded
+        # OnDeviceEngine — is still valid) — re-applied onto the fresh
+        # brain at the end of init(). See set_ondevice_generator().
+        self.ondevice_generator = None
 
 
 _session = _Session()
@@ -167,8 +172,37 @@ def init(storage_dir, config_json=""):
         _session.brain = PetBrain(memory=_session.memory, engine=_session.engine)
         _session.memory.summarizer = _session.brain.summarize
         _session.last_tick_ms = None
+        if _session.ondevice_generator is not None:
+            _session.brain.set_ondevice_generator(
+                _wrap_ondevice_callback(_session.ondevice_generator))
         cfg = json.loads(config_json) if config_json else {}
         _apply_pet_config_locked(cfg)
+
+
+def set_ondevice_generator(callback):
+    """Registers the on-device LLM callback for provider == 'ondevice'
+    (docs/android_plan.md §5.4 item 3). `callback` is any object exposing a
+    `generate(system_prompt, user_prompt, max_tokens) -> str` method —
+    Android's `PetBridge.kt` passes a small Kotlin object wrapping
+    `OnDeviceEngine.generate()`; Chaquopy makes calling its method from
+    Python transparent. Pass None to clear it (e.g. the on-device model
+    failed to load, so provider "ondevice" should behave as unavailable
+    rather than crash). Safe to call before or after `init()` — actually
+    wiring it into the live `PetBrain` happens lazily in `_apply_pet_config_locked`
+    on the next `update_config()`/`init()` call, so call `update_config()`
+    (even with the same config) after this if you need it to take effect
+    immediately without waiting for the next config change."""
+    with _session.lock:
+        _session.ondevice_generator = callback
+        if _session.brain is not None:
+            _session.brain.set_ondevice_generator(
+                _wrap_ondevice_callback(callback) if callback is not None else None)
+
+
+def _wrap_ondevice_callback(callback):
+    def _generate(system, user, num_predict):
+        return callback.generate(system, user, num_predict)
+    return _generate
 
 
 def update_config(config_json):

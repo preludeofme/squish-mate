@@ -45,11 +45,13 @@
         <item>OpenAI</item>
         <item>Anthropic (Claude)</item>
         <item>OpenRouter</item>
+        <item>On-device (Gemma, offline)</item>
     </string-array>
     <string-array name="llm_provider_ids">
         <item>ollama</item>
         <item>openai</item>
         <item>anthropic</item>
         <item>openrouter</item>
+        <item>ondevice</item>
     </string-array>
 </resources>

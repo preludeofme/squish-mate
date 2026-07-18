@@ -275,6 +275,130 @@ would need to be involved in or explicitly schedule):**
   build type currently uses the debug keystore, explicitly marked
   temporary/must-not-ship in both `build.gradle.kts` and the README).
 
+## On-device LLM provider added: llama.cpp + Ryan's chosen Gemma-4-E2B GGUF (2026-07-17, same day)
+Ryan asked for a fully offline on-device model. He picked
+https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf (GGUF, ~3.35GB,
+`gated: false` — no account/license-acceptance friction, unlike the
+MediaPipe/LiteRT path floated earlier this session) — this **superseded**
+the earlier MediaPipe `tasks-genai` Gradle dependency added in the prior
+turn (removed; GGUF isn't a format MediaPipe's LLM Inference API can load,
+llama.cpp is the correct runtime for it). Confirmed `llama.cpp` upstream
+(`ggml-org/llama.cpp`, master) already has `LLM_ARCH_GEMMA4` support before
+committing to this approach.
+
+**What's actually in place now:**
+- Model weights (`/home/trubuck-design/models/gemma-4-E2B_q4_0-it.gguf`,
+  3,349,516,256 bytes, verified complete) and vendored `llama.cpp` source
+  (`/home/trubuck-design/models/llama.cpp-src`, shallow clone) both live
+  OUTSIDE the repo — same reasoning as `core/pyproject.toml`'s own
+  comment about Gradle input/output overlap, plus a multi-GB binary and a
+  full C++ codebase don't belong in git history either way.
+- `android/app/build.gradle.kts`: `ndkVersion = "27.3.13750724"` (installed
+  via `sdkmanager`), `externalNativeBuild` pointing at
+  `src/main/cpp/CMakeLists.txt` (cmake 3.31.6, also installed via
+  `sdkmanager`), `-DLLAMA_SRC_DIR` passed from a `llamaSrcDir` Gradle
+  property (defaults to the path above, overridable with `-P`). **`ndk.abiFilters`
+  narrowed from `[arm64-v8a, armeabi-v7a]` to `[arm64-v8a]` only** — a 2B+
+  param model is impractical on 32-bit ARM's address space/RAM, and this
+  avoids per-ABI conditional complexity in the native build; dropped
+  app-wide rather than per-library. This also means: **the on-device
+  provider is fundamentally untestable on this dev machine's x86_64
+  emulator** — it can only be verified on Ryan's real (presumably arm64)
+  phone.
+- `android/app/src/main/cpp/`: `CMakeLists.txt`, `llm_bridge.cpp`,
+  `logging.h` — adapted from llama.cpp's own official
+  `examples/llama.android` reference app (Apache-2.0), simplified to a
+  single **stateless** `nativeGenerate(system, user, maxTokens)` JNI call
+  (reset KV cache + reprocess system+user prompt fresh every call) instead
+  of the reference's persistent multi-turn chat-session design — matches
+  how every other provider already works (`PetBrain._chat()` sends a
+  complete system+user pair per call, no server-side conversation state to
+  preserve). One real fix needed during this adaptation:
+  `__android_log_is_loggable()` is API 30+ only and this app's minSdk is
+  26 — `logging.h`'s log-gating function now always returns true instead
+  (logcat itself still filters by tag/priority on the consumption end).
+- `android/app/src/main/java/.../llm/OnDeviceEngine.kt`: Kotlin JNI
+  wrapper. Deliberately synchronous/blocking (no coroutines/Flow, unlike
+  the ARM reference) — matches this app's existing threading convention
+  (every caller already runs on `OverlayService`/`MainActivity`'s
+  dedicated `workerHandler`) and avoids introducing a new concurrency
+  paradigm into a codebase that has never used coroutines.
+- **Full compile verified for real** (this sandbox has NDK+cmake+Gradle,
+  so this wasn't just "should work" — `./gradlew assembleDebug` actually
+  built llama.cpp + ggml (hardware-adaptive ARM CPU kernels, KleidiAI
+  SME2, ARMv8.0 through ARMv9.2 dispatch) + our JNI bridge end to end).
+  Debug APK 41MB (smaller than the pre-Chaquopy-only 29MB baseline might
+  suggest — dropping armeabi-v7a saved more than the new libs cost).
+- **Python side** (`core/pet_brain.py`, `core/bridge.py`): new provider
+  `"ondevice"`. `PetBrain._chat_ondevice()` calls a registered
+  `self._ondevice_generator(system, user, num_predict)` callback instead
+  of any HTTP call — same "text or None, never raises" contract as every
+  other `_chat_*` path. `core/bridge.py.set_ondevice_generator(callback)`
+  is the new bridge entry point Android calls once the model is loaded;
+  `callback` is expected to expose a `.generate(system, user, max_tokens)`
+  method — Chaquopy makes calling a Kotlin object's method from Python
+  transparent, no extra glue needed. The callback is stored on the
+  session (`_session.ondevice_generator`) and **re-applied automatically
+  after a fresh `init()`** (e.g. app restart) since a new `PetBrain`
+  instance would otherwise lose it — the host's already-loaded model is
+  still valid across a bridge reset, only the callback registration is
+  session-scoped by default.
+- **Kotlin wiring**: `PetBridge.setOnDeviceGenerator(engine: OnDeviceEngine?)`
+  — passes `OnDeviceEngine` itself as the callback (its `generate(...)`
+  method's name/signature already match what Python calls; no separate
+  wrapper class needed). Both `OverlayService` and `MainActivity`
+  (in-app-fallback) gained `ensureOnDeviceModelState(provider)`, called
+  right after every `PetBridge.init`/`updateConfig`: loads the ~3GB model
+  (from `context.filesDir/models/gemma-4-E2B_q4_0-it.gguf` —
+  `OnDeviceEngine.MODEL_FILENAME`/`.modelFile()`) only while `llm_provider
+  == "ondevice"` is actually selected, unloads it (frees the RAM) the
+  moment it isn't, including in both `onDestroy()`/teardown paths.
+  Deliberately conservative with RAM — same opt-in-only posture as every
+  other heavy feature in this app (Usage Access, device events).
+- Settings: `strings.xml`'s `llm_provider_labels`/`llm_provider_ids`
+  arrays gained "On-device (Gemma, offline)" / `"ondevice"` — zero other
+  Settings-screen changes needed since `llmProvider` was already a
+  free-text field round-tripping through `PetSettingsStore` unchanged.
+- **Real R8 bug found and fixed while verifying the release build still
+  works with all this added**: `OnDeviceEngine.generate()` (and its
+  `nativeGenerate` native method) were silently dead-code-eliminated by
+  R8 — confirmed via `dexdump` on the actual built APK, not assumed —
+  because it's only ever called reflectively FROM Python via Chaquopy
+  (`generator.generate(...)`), a call site R8's Kotlin/Java-only call-graph
+  analysis can't see. This is the one real exception to
+  `proguard-rules.pro`'s existing "nothing here is reflective" comment
+  (now corrected) — added `-keep class .../llm/OnDeviceEngine { public *; }`
+  and **re-verified via dexdump on a rebuilt release APK** that
+  `nativeGenerate` (and everything else) survives intact. AGP's default
+  rules already correctly protect native METHOD NAMES (`native <methods>`
+  keep rule) — that part was never broken — but that alone doesn't stop
+  the surrounding Kotlin method from being eliminated as unreachable.
+- Python suite: 42/42 (3 new `test_bridge.py` cases:
+  `test_ondevice_generator_wired_into_brain`,
+  `test_ondevice_generator_survives_reinit`,
+  `test_ondevice_generator_failure_falls_back_safely` — all using a fake
+  Python object with a `.generate()` method to simulate what Chaquopy
+  would hand across from a real Kotlin `OnDeviceEngine`).
+  `./gradlew assembleDebug assembleRelease testDebugUnitTest` all green.
+
+**What's NOT done / genuinely can't be done from this machine:**
+- The model file has not been pushed to any device yet, and the whole
+  on-device path has never actually run — this sandbox's only available
+  emulator is x86_64, and the native build is arm64-v8a only by design
+  (see above), so there is no way to runtime-test this here at all. This
+  needs Ryan's real (arm64) phone connected via adb: `adb push
+  /home/trubuck-design/models/gemma-4-E2B_q4_0-it.gguf /sdcard/ && adb
+  shell run-as com.preludeofme.squishmate sh -c 'mkdir -p files/models &&
+  cp /sdcard/gemma-4-E2B_q4_0-it.gguf files/models/'` (or equivalent),
+  then select "On-device (Gemma, offline)" in Settings.
+- No in-app model download/picker UI — out of scope until the manual
+  adb-push path is proven to actually work end-to-end on real hardware.
+- Generation speed/quality/battery cost on real hardware is completely
+  unmeasured (CPU-only inference of a ~4B-equivalent quantized model on a
+  phone — could be anywhere from "fine" to "too slow to feel like ambient
+  chatter" depending on the device; needs real measurement, not a guess).
+- Nothing committed anywhere.
+
 ## How to verify visually (needs graphical session)
 ```bash
 cd ~/Projects/Personal/desktop-pet

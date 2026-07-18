@@ -190,6 +190,76 @@ class TestBridge(unittest.TestCase):
         # Engine survived a simulated day without raising.
         self.assertIsNotNone(bridge._session.engine.state)
 
+    def test_ondevice_generator_wired_into_brain(self):
+        """docs/android_plan.md §5.4 item 3 — provider 'ondevice' has no
+        HTTP call of its own; PetBridge.kt registers a Kotlin-object
+        callback via set_ondevice_generator(). Simulate that with a plain
+        Python object exposing .generate(...), matching the shape Chaquopy
+        would hand PetBrain._chat_ondevice() for a real Kotlin object."""
+        class FakeOnDeviceEngine:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, system, user, num_predict):
+                self.calls.append((system, user, num_predict))
+                return "a real on-device reply"
+
+        fake_engine = FakeOnDeviceEngine()
+        bridge.init(self.storage_dir, json.dumps({
+            "name": "TestPip",
+            "llm_provider": "ondevice",
+            "message_frequency": "chatty",
+        }))
+        bridge.set_ondevice_generator(fake_engine)
+        bridge.update_config(json.dumps({
+            "name": "TestPip",
+            "llm_provider": "ondevice",
+            "message_frequency": "chatty",
+        }))
+
+        self.assertTrue(bridge._session.brain.available())
+        text = bridge._session.brain.think({"active_app": "TestApp"}, force=True)
+        self.assertEqual(text["text"], "a real on-device reply")
+        self.assertEqual(len(fake_engine.calls), 1)
+
+    def test_ondevice_generator_survives_reinit(self):
+        """A fresh init() (e.g. app restart) replaces `brain`, but the
+        host's already-loaded on-device model/callback is still valid and
+        should carry over without the host having to re-register it."""
+        class FakeOnDeviceEngine:
+            def generate(self, system, user, num_predict):
+                return "still here after reinit"
+
+        bridge.init(self.storage_dir, json.dumps({"llm_provider": "ondevice"}))
+        bridge.set_ondevice_generator(FakeOnDeviceEngine())
+        bridge.init(self.storage_dir, json.dumps({"llm_provider": "ondevice"}))
+
+        self.assertTrue(bridge._session.brain.available())
+
+    def test_ondevice_generator_failure_falls_back_safely(self):
+        """A raising/broken callback must never surface as a bridge
+        exception — same 'always get a usable line' contract as network
+        failures for the hosted providers."""
+        class BrokenOnDeviceEngine:
+            def generate(self, system, user, num_predict):
+                raise RuntimeError("native inference crashed")
+
+        bridge.init(self.storage_dir, json.dumps({
+            "name": "TestPip", "llm_provider": "ondevice", "message_frequency": "chatty",
+        }))
+        bridge.set_ondevice_generator(BrokenOnDeviceEngine())
+        bridge.update_config(json.dumps({
+            "name": "TestPip", "llm_provider": "ondevice", "message_frequency": "chatty",
+        }))
+
+        # Call the brain directly (bypassing engine gating, which can
+        # legitimately withhold speech for reasons unrelated to this test —
+        # e.g. cooldowns) to isolate "does a broken on-device callback still
+        # yield a usable fallback line."
+        comment = bridge._session.brain.idle_comment(force=True)
+        self.assertIsInstance(comment["text"], str)
+        self.assertTrue(len(comment["text"]) > 0)
+
 
 if __name__ == "__main__":
     unittest.main()

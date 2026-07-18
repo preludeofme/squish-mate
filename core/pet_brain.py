@@ -117,6 +117,14 @@ class PetBrain:
         self.api_key = api_key or None
         self._model_override = (model_override or "").strip()
         self.base_url = base_url or None
+        # On-device inference (docs/android_plan.md §5.4 item 3, provider
+        # "ondevice"): unlike every other provider, this one can't make its
+        # own HTTP/socket call — Python has no GGUF/llama.cpp runtime, so
+        # generation happens in Kotlin (`OnDeviceEngine`/`llm_bridge.cpp`)
+        # and this module just calls back into it. See
+        # `core/bridge.py.set_ondevice_generator`, which is how a host
+        # (Android's `PetBridge`) registers this.
+        self._ondevice_generator = None
 
     def set_provider(self, provider, api_key=None, model_override=None, base_url=None):
         """Live-swap the LLM backend (e.g. from the Settings dialog)."""
@@ -125,8 +133,18 @@ class PetBrain:
         self._model_override = (model_override or "").strip()
         self.base_url = base_url or None
 
+    def set_ondevice_generator(self, generator):
+        """Register the callback used for provider == 'ondevice'.
+        `generator(system: str, user: str, num_predict: int) -> str | None`
+        — any host-side callable (a bound method, a Chaquopy-wrapped Kotlin
+        object's method, etc.). Pass None to clear it (e.g. if the on-device
+        model fails to load)."""
+        self._ondevice_generator = generator
+
     @property
     def model(self):
+        if self.provider == "ondevice":
+            return self._model_override or "gemma-4-E2B-it-qat-q4_0-gguf"
         if self.provider != "ollama":
             return self._model_override or llm_providers.DEFAULT_MODELS.get(
                 self.provider, self._model)
@@ -219,6 +237,9 @@ class PetBrain:
         if self.model == "engine_only":
             logger.info("_chat: skipped — model set to 'engine_only'")
             return None
+        if self.provider == "ondevice":
+            # No `requests` needed — this path never touches the network.
+            return self._chat_ondevice(system, user, num_predict)
         if requests is None:
             logger.info("_chat: skipped — 'requests' package not available")
             return None
@@ -330,9 +351,35 @@ class PetBrain:
         logger.warning("_chat: empty content from %s", self.provider)
         return None
 
+    def _chat_ondevice(self, system, user, num_predict):
+        """Route a chat call through the host's registered on-device
+        generator (`set_ondevice_generator` — Android's `PetBridge` wires
+        this to `OnDeviceEngine.generate()` via Chaquopy). Same contract as
+        every other `_chat_*` path: text or None, never raises."""
+        if self._ondevice_generator is None:
+            logger.info("_chat: skipped — no ondevice generator registered")
+            return None
+        logger.info(
+            "_chat: calling on-device model='%s' (num_predict=%s) user='%s'",
+            self.model, num_predict, user[:120],
+        )
+        try:
+            content = self._ondevice_generator(system, user, num_predict)
+        except Exception as e:
+            logger.warning("_chat: ondevice generation FAILED: %s", e)
+            return None
+        if content:
+            logger.info("_chat: received %d chars from ondevice: %r",
+                        len(content), content[:200])
+            return content
+        logger.warning("_chat: empty content from ondevice")
+        return None
+
     def available(self):
         if self.model == "engine_only":
             return False
+        if self.provider == "ondevice":
+            return self._ondevice_generator is not None
         if self.provider != "ollama":
             return bool(self.api_key)
         if requests is None:
