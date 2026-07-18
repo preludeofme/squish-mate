@@ -285,18 +285,25 @@ class MeaningfulChangeDetector:
 
 class PetEngine:
     def __init__(self, state_path=STATE_PATH, config=None):
-        # Migrate legacy desktop-pet directory to squish-mate if it exists
-        old_dir = os.path.expanduser("~/.config/desktop-pet")
-        new_dir = os.path.expanduser("~/.config/squish-mate")
-        if not os.path.exists(new_dir) and os.path.exists(old_dir):
-            try:
-                import shutil
-                shutil.copytree(old_dir, new_dir)
-                logger.info("Migrated old desktop-pet configuration directory to squish-mate.")
-            except Exception as e:
-                logger.error(f"Failed to migrate old configuration directory: {e}")
-
         self.state_path = state_path
+        self.backup_path = self.state_path + ".bak"
+
+        # Migrate legacy desktop-pet directory to squish-mate if it exists.
+        # Only relevant for the desktop app's default `~/.config` layout — a
+        # caller that injects a custom state_path (e.g. an embedded/mobile
+        # host) owns its own storage dir and should never touch the desktop
+        # user's home directory.
+        if self.state_path == STATE_PATH:
+            old_dir = os.path.expanduser("~/.config/desktop-pet")
+            new_dir = os.path.expanduser("~/.config/squish-mate")
+            if not os.path.exists(new_dir) and os.path.exists(old_dir):
+                try:
+                    import shutil
+                    shutil.copytree(old_dir, new_dir)
+                    logger.info("Migrated old desktop-pet configuration directory to squish-mate.")
+                except Exception as e:
+                    logger.error(f"Failed to migrate old configuration directory: {e}")
+
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.lock = threading.Lock()
         self.detector = MeaningfulChangeDetector(self.config["meaningfulChangeThreshold"])
@@ -465,9 +472,9 @@ class PetEngine:
         return repaired
 
     def _recover_backup(self, default_state):
-        if os.path.exists(BACKUP_PATH):
+        if os.path.exists(self.backup_path):
             try:
-                with open(BACKUP_PATH, "r", encoding="utf-8") as f:
+                with open(self.backup_path, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 self.state = self._repair_state(loaded, default_state)
                 logger.warning("Recovered state from backup file successfully.")
@@ -503,12 +510,12 @@ class PetEngine:
             
             # Backup current state
             if os.path.exists(self.state_path):
-                if os.path.exists(BACKUP_PATH):
+                if os.path.exists(self.backup_path):
                     try:
-                        os.remove(BACKUP_PATH)
+                        os.remove(self.backup_path)
                     except OSError:
                         pass
-                os.rename(self.state_path, BACKUP_PATH)
+                os.rename(self.state_path, self.backup_path)
             
             os.rename(tmp, self.state_path)
             self._last_save_time = now

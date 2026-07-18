@@ -834,3 +834,687 @@ Android LLM path (no on-device Ollama); Android monitors are necessarily
 shallower (UsageStats package-only, no titles; keystroke monitor dropped).
 Supersedes the older `squish-mate_split_plan.md` multi-repo split — plan
 says don't split repos yet. No code changed.
+
+## Android implementation started: Phase 0 (this repo) + Phase 1 skeleton (2026-07-17, same day)
+Ryan asked to create a branch and begin the full implementation from
+`docs/android_plan.md`. Created branch `feature/android-support` in this
+repo (Phase 0 work below lives here, uncommitted — not committed per
+standing instruction to only commit when explicitly asked). Also scaffolded
+the new `squish-mate-android` repo as a sibling directory
+(`~/Projects/Personal/squish-mate-android`, `git init`'d + staged, not
+committed) per the plan's §6 layout, and got a full Chaquopy debug build
+green end-to-end (see "Phase 1" below) — this is real, not aspirational:
+`./gradlew assembleDebug` actually pip-installs this repo's `core` package
+into an embedded Python interpreter and produces a working APK.
+
+**Phase 0 (`core/` embeddability), done in this repo:**
+- `core/pet_engine.py`: `PetEngine.__init__` now computes
+  `self.backup_path = self.state_path + ".bak"` instead of using the
+  module-level `BACKUP_PATH` constant everywhere (3 call sites:
+  `_recover_backup`, `_save_state_locked` ×2 usages) — a caller with a
+  custom `state_path` (e.g. an embedded host) now gets its OWN backup file
+  next to its own state file, not the desktop default's `.bak`. The
+  legacy `~/.config/desktop-pet` → `~/.config/squish-mate` migration block
+  is now gated behind `if self.state_path == STATE_PATH:` — it only runs
+  for the desktop app's default path, so an embedded host constructing
+  `PetEngine(state_path=...)` with a custom path never touches the desktop
+  user's home directory at all. Desktop behavior is bit-for-bit unchanged
+  (default `state_path` is still `STATE_PATH`).
+- `core/pet_memory.py` and `core/pet_performance.py` needed NO changes —
+  `PetMemory` already takes an unused-when-`engine=`-is-set `path` param
+  (vestigial, not worth touching), and `pet_performance.py`'s hardware
+  detection (`detect_hardware`/`get_cpu_model`/`get_gpu_info`/
+  `get_battery_info`) already wraps every `subprocess`/`platform` probe in
+  try/except with safe defaults (8GB RAM, 2 cores → `recommend_mode_static`
+  falls through to `"low"`) — verified by reading, not just assumed. The
+  bridge (below) also never touches the Ollama-tier `PERFORMANCE_MODES`
+  system at all for its default hosted-provider path, so Android's v1 LLM
+  path doesn't exercise that code either way. No "mobile" tier was added
+  to `PERFORMANCE_MODES` — not needed since the bridge doesn't use it;
+  revisit only if Android ever exposes the Ollama tier-benchmark UI
+  (LAN-Ollama mode per the plan doesn't need it — `resolvedMode` just
+  stays at its default `"low"` and `PetBrain.model` resolves fine).
+- **New `core/bridge.py`** — the JSON-in/JSON-out facade
+  (`init`/`update_config`/`tick`/`on_activity`/`on_interaction`/
+  `idle_comment`/`get_state`/`shutdown`), a module-level singleton
+  session (not a class the host constructs — the functions themselves are
+  the API). Mirrors `desktop_pet.py`'s actual call patterns closely:
+  - `on_activity` reproduces `process_activity_change`'s
+    `register_event` → `get_behavior_gating` → (if allowed)
+    `brain.think()` flow, minus the Qt request-queue (Chaquopy already
+    runs bridge calls on its own thread per the plan, so it's fine to
+    block).
+  - `on_interaction` deliberately does NOT call the brain — verified by
+    reading desktop's `_on_pet_clicked`, which also just calls
+    `register_event` and lets the *animator* (client-side) react visually.
+    Bridge callers get engine state feedback (needs/energy/wake) but no
+    LLM round-trip on every tap.
+  - `_speak_or_fallback` always returns a usable comment dict (falls back
+    to `pet_brain.SAFE_FALLBACKS`, not desktop's separate `SAFE_IDLE` list
+    — that list lives in `desktop_pet.py`, outside `core/`, so bridge
+    reuses the core-owned fallback list instead of duplicating one).
+  - `MESSAGE_FREQUENCY_PRESETS` is a deliberate small duplication of
+    `ui/pet_settings.py`'s dict (idle_prob/brain_cooldown only) — NOT
+    imported, because `ui/` is PySide6-only and `core/` must stay
+    Qt-import-free for non-desktop hosts.
+  - `PetEngine.lock` is a plain (non-reentrant) `threading.Lock`, not an
+    RLock — bridge functions never wrap a `with engine.lock:` around calls
+    to engine methods that self-lock (`register_event`, `tick`,
+    `get_behavior_gating`, `select_action`, `is_sleeping`); state reads
+    for the JSON snapshot happen without holding the lock, matching how
+    `desktop_pet.py` itself casually reads `self.engine.state` unlocked in
+    several places.
+- **New `tests/test_bridge.py`** (15 tests, all passing, `.venv/bin/python
+  -m unittest discover -s tests` → 39/39 total including this file) —
+  uses a key-less hosted provider (`llm_provider: "openai"`,
+  `llm_api_key: ""`) so `PetBrain.available()` returns `False` immediately
+  with NO network call (`bool(self.api_key)` short-circuit), making every
+  test fast/deterministic/offline. Includes the Phase-0 exit-criterion
+  smoke test from the plan: `test_simulated_day_of_ticks_and_activity_headless`
+  runs 200 ticks interleaved with activity/interaction/idle-comment calls
+  with monotonically increasing `now_ms`, asserting valid JSON throughout.
+  One gotcha worth remembering: a freshly-created `PetEngine`'s
+  `lastSpeechAt` defaults to "now" (state creation time), so the very
+  first `on_activity` call within 60s of `init()` is legitimately gated
+  silent by the global speech cooldown — tests that want to exercise the
+  "speech allowed" path need to backdate
+  `bridge._session.engine.state["behavior"]["lastSpeechAt"]` first (not a
+  bug, matches desktop behavior).
+- **New `pyproject.toml`** at repo root — declares `squish-mate-core`
+  (import name `core`, `packages = ["core"]`), single dependency
+  `requests>=2.28` (deliberately NOT `psutil` — optional/guarded at
+  runtime, doesn't build on Android). This is what makes the Android
+  Chaquopy build's `pip { install("../../squish-mate") }` work (verified
+  live, see Phase 1 below — it actually builds a `squish_mate_core-0.1.0`
+  wheel from this repo and installs it into the embedded interpreter).
+  `package.json`'s existing "cosmetic debt" note in handoff.md is now
+  formally superseded for `core/`'s packaging by this file (package.json
+  itself untouched — still describes the whole repo for whatever thin
+  purpose it served before).
+
+**Phase 1 (Android app skeleton), new sibling repo
+`~/Projects/Personal/squish-mate-android`** (git-initialized, all files
+staged, nothing committed):
+- Gradle 8.9 + AGP 8.5.2 + Kotlin 1.9.24 + Chaquopy 16.0.0, minSdk 26 /
+  compileSdk 34 / targetSdk 34, `abiFilters = [arm64-v8a, armeabi-v7a]`
+  (size-conscious per the plan's Phase 5 concern). Wrapper generated from
+  a pre-cached local Gradle 8.9 distribution
+  (`~/.gradle/wrapper/dists/gradle-8.9-all/...`); the environment has a
+  usable `ANDROID_HOME=/usr/lib/android-sdk` (platform 34, build-tools
+  34.0.0) and outbound network access (PyPI + Chaquopy's package index +
+  Gradle Plugin Portal all reachable) — confirmed by an actual successful
+  `./gradlew assembleDebug` (27.9MB debug APK,
+  `app/build/outputs/apk/debug/app-debug.apk`, gitignored).
+- `app/build.gradle.kts`'s `chaquopy { defaultConfig { pip {
+  install("../../squish-mate") } } }` is explicitly documented as
+  **local-dev-only** wiring (both repos as siblings) — before any public
+  release this needs to switch to
+  `install("squish-mate-core @ git+https://github.com/preludeofme/squish-mate.git@vX.Y.Z")`
+  per the plan's §6. Whoever does Phase 5 release packaging must not
+  forget this.
+- Package structure exactly matches the plan's §6 layout
+  (`overlay/`, `bridge/`, `anim/`, `render/`, `monitor/`, `settings/` —
+  only `overlay/` and `bridge/` have real code yet, the rest are empty
+  dirs staged for Phase 2-4).
+- `PetBridge.kt` (`bridge/`) is the ONLY Kotlin class that imports
+  Chaquopy's `Python`/`PyObject` — every other class goes through it.
+  Blocking by design (network calls inside); doc comment explicitly warns
+  callers off the main thread.
+- `OverlayService.kt`: foreground service, `TYPE_APPLICATION_OVERLAY`
+  window (API 26 floor), a dedicated `HandlerThread` for all
+  `PetBridge`/Python calls (never on the main/UI thread), a 2s tick loop
+  matching desktop's `QTimer` cadence, `ACTION_SCREEN_ON`/`OFF`
+  broadcast-receiver gating (stops ticking screen-off, per the plan's
+  battery goal), drag-to-move via `WindowManager.updateViewLayout`.
+  `PetBridge.init(filesDir.absolutePath, "{}")` — Phase 1 uses engine
+  defaults with no LLM provider configured yet (Phase 3 wires real
+  Settings/API keys through `update_config`).
+  Not yet done: feeding the tick snapshot (emotion/action/sleeping) back
+  into `PetView`'s render/animation state — currently ticks the engine and
+  logs-on-error only. That wiring is trivial once Phase 2's real animator
+  exists; wasn't worth building against the Phase-1 placeholder circle.
+- `PetView.kt` (`overlay/`): Phase-1 **placeholder** — a plain circle with
+  two eye-dots, NOT the real blob renderer (that's Phase 2, porting
+  `ui/blob_renderer.py`). Its job right now is proving out
+  tap/longpress/fling (via `GestureDetector`) + drag (manual
+  `ACTION_MOVE` delta tracking, 24px slop before a drag counts) touch
+  plumbing that Phase 2 drops the real renderer into unchanged.
+  `PetView.Listener.onInteraction(kind)` feeds `PetBridge.onInteraction`
+  on the worker thread.
+- `MainActivity.kt`: overlay-permission onboarding
+  (`Settings.ACTION_MANAGE_OVERLAY_PERMISSION` deep link,
+  `Settings.canDrawOverlays()` check on resume) + `POST_NOTIFICATIONS`
+  runtime request on API 33+ + start/stop `OverlayService`. Does NOT yet
+  implement the in-app fallback pet view for users who deny the overlay
+  permission (plan §5.1's fallback mode) — the toggle button is simply
+  disabled until permission is granted. Worth flagging to Ryan/next agent
+  as a known Phase-1 gap, not forgotten.
+- `AndroidManifest.xml` declares all the plan's §5.7 required permissions
+  (`SYSTEM_ALERT_WINDOW`, `FOREGROUND_SERVICE`,
+  `FOREGROUND_SERVICE_SPECIAL_USE`, `POST_NOTIFICATIONS`, `INTERNET`) plus
+  `PACKAGE_USAGE_STATS` pre-declared for Phase 4 (unused/unrequested at
+  runtime yet). Foreground service type is `specialUse` with the required
+  API-34 `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` manifest property.
+- Launcher icon/notification icon are simple placeholder vector shapes
+  (adaptive icon, min-SDK-26-only so no legacy raster mipmaps needed) —
+  cosmetic, not a real asset pass.
+- **Not done, explicitly out of scope for this pass**: Phase 2 (real
+  renderer/animator port + golden tests), Phase 3 (Settings UI, hosted-LLM
+  key entry wired to `update_config`, LAN Ollama URL setting), Phase 4
+  (UsageStats/battery event sources feeding `on_activity`), Phase 5
+  (battery/OEM-killer hardening, release signing, Play declarations). No
+  emulator/device was used — verification is "it compiles and packages
+  into a real APK via Chaquopy," not "it renders/runs correctly on a
+  screen." Next agent picking this up should start with Phase 2's
+  BlobRenderer port since Phase 1's `PetView` placeholder is deliberately
+  built to swap it in without touching `OverlayService`'s plumbing.
+- Neither repo's changes are committed (only staged in
+  `squish-mate-android`; `squish-mate`'s `feature/android-support` branch
+  has the Phase 0 changes as plain working-tree edits) — per standing
+  instruction to only commit when Ryan explicitly asks.
+
+## Android app folded into this repo as `android/` (2026-07-17, same day)
+Ryan asked for the Android code to live inside this project instead of a
+sibling repo. Moved `~/Projects/Personal/squish-mate-android` →
+`squish-mate/android/` (plain subdirectory, NO nested `.git` — it's just
+tracked as part of this repo on `feature/android-support`, still
+uncommitted/untracked pending Ryan's go-ahead). Old sibling directory
+deleted.
+
+This surfaced a real structural problem, not just path updates: with
+`android/` nested inside `squish-mate/`, Chaquopy's local-path `pip install`
+of the whole repo root made Gradle's task-validation fail — the pip
+source directory (repo root) was an ANCESTOR of the Android build's own
+output directory (`android/app/build/...`), so Gradle detected several
+tasks (`generateDebugPythonRequirements`, `mergeDebugResources`,
+`dataBindingGenBaseClassesDebug`) writing/reading overlapping locations
+without a declared dependency, and refused to build (`BUILD FAILED`, not
+just a warning). Fixed by giving `core/` its OWN `pyproject.toml`
+(**moved from repo root to `core/pyproject.toml`**, using
+`[tool.setuptools.package-dir] core = "."` so the package still installs/
+imports as `core` even though the pyproject file now lives inside the
+package's own directory) and pointing Chaquopy at `install("../../core")`
+instead of `install("../..")`. `core/` and `android/` are siblings under
+the repo root with no nesting either direction, so there's no overlap —
+verified with a clean `./gradlew assembleDebug` from the new location
+(`BUILD SUCCESSFUL`, same ~27.9MB debug APK). **Anyone touching Python
+packaging for this repo should know `pyproject.toml` now lives in
+`core/`, not the repo root** — `tests/test_bridge.py` etc. are unaffected
+(they import via `sys.path.insert` of the repo root, not via the
+installed package).
+- `.gitignore` (root): added `core/build/` and `*.egg-info/` (pip build
+  artifacts land in `core/` now, not repo root) plus a note pointing to
+  `android/.gitignore` for the Gradle-specific ignores.
+- `android/README.md` updated: "Local dev setup" now describes `android/`
+  as a subdirectory of this repo (not a sibling checkout), and the pip
+  path is `../../core`.
+- Rebuilding after this move leaves `core/build/` and
+  `core/squish_mate_core.egg-info/` as local artifacts — both gitignored,
+  already cleaned from the working tree in this pass, but expect them to
+  reappear on the next `./gradlew` build (harmless, ignored).
+
+## Android Phase 2: BlobRenderer/PetAnimator Kotlin port + golden test (2026-07-17, same day)
+Ryan asked to continue the implementation. Did the big Phase-2 item flagged
+as "next" in the previous entry: ported `ui/pet_animator.py` and
+`ui/blob_renderer.py` to Kotlin, wired them into `PetView` in place of the
+Phase-1 placeholder circle, and — critically — built the cross-language
+**golden test** the plan calls for in §5.2/§8, which actually passes.
+
+- **`scripts/generate_animator_golden.py`** (new, desktop repo) — regenerates
+  `android/app/src/test/resources/animator_golden.json`. Key design
+  decision: Python's Mersenne Twister and Kotlin's `java.util.Random`
+  can't be seeded to produce identical sequences, so bit-exact parity is
+  only achievable for code paths that never touch `random`. Solved by
+  scripting ONLY explicit `trigger_X(force=True)` calls + fixed dt steps
+  (never `trigger_wander`/`surprise_and_flee`, which pick random targets)
+  and constructing the animator with all frequency ranges set to
+  `(1e6, 1e6)` + `_next_blink` overridden to `1e6`, so `_update_behavior`'s
+  natural random scheduling and auto-blink never fire during the script
+  regardless of elapsed time. Every pose-shaping formula that DOES get
+  exercised (hop/wave/yawn/stretch/dance/somersault/eat/giggle/sleep-wake/
+  drag/manual-glide-movement/expression-blend-in-out) is pure
+  sin/cos/exp/dt math — fully portable. 710 frames captured, includes a
+  spot-check that HAPPY/SCARED expression blending shows up mid-fixture
+  (frames ~610/665-680) not just at trigger time.
+- **`android/app/src/main/java/.../anim/PetAnimator.kt`** (new) — line-for-
+  line port. Notable porting gotcha: Kotlin's `Random.nextDouble(from,
+  until)` throws `IllegalArgumentException` when `from >= until` (Python's
+  `random.uniform(a, a)` just returns `a`) — `sched()` has an explicit
+  `if (range.second > range.first)` guard falling back to `t + range.first`
+  so the golden script's `(1e6, 1e6)` ranges don't crash the constructor.
+  Added one thing Python doesn't have: `triggerAction(action: String)`,
+  a string-dispatch mirroring desktop's `trigger_method =
+  f"trigger_{action}"` pattern in `_tick_engine`, since Kotlin can't do
+  Python's `getattr(obj, f"trigger_{action}")` reflection trick as
+  tersely — this is what `PetView.applyEngineSnapshot` calls.
+- **`android/app/src/main/java/.../anim/PetExpressions.kt`** (new) — port
+  of `Emotion`/`EMOTION_POSE` only (pose deltas). Deliberately did NOT
+  port `classify_emotion(text)` (the tone-word regex matcher) — Android
+  gets `suggestedEmotion` directly from the engine via
+  `core/bridge.py`'s JSON snapshots, so there's no raw LLM text needing
+  local re-classification the way desktop's fallback path sometimes
+  needs. Added `Emotion.fromEngineString()` to map the engine's
+  `EMOTIONS` list (`core/pet_engine.py`) to this smaller pose-overlay
+  enum; unmapped ones (curious, concerned, hurt→SCARED is mapped, sleepy,
+  excited, content) intentionally fall back to NEUTRAL (no facial
+  overlay) — matches how desktop's own callers only ever pass emotions
+  that have an `EMOTION_POSE` entry.
+- **`android/app/src/main/java/.../render/BlobRenderer.kt`** (new) —
+  Canvas/Path port of the Bézier silhouette + shape-preset system
+  (`SHAPE_PRESETS`, all 6 archetypes incl. antenna styles/horns) +
+  gradient body fill + face/eyes/blush/mouth/food-prop + zzz sleep text.
+  `QColor.lighter()/.darker()` approximated via HSV-value scaling
+  (`lighterColor`/`darkerColor` helpers) — visually close to Qt's actual
+  algorithm but NOT bit-exact, which is fine: unlike the animator, the
+  renderer is intentionally NOT golden-tested (it's a paint routine, not
+  deterministic state math) — the plan's own §8 only calls for animator
+  golden tests. Verified by compiling + the existing `assembleDebug`
+  packaging successfully, NOT by rendering on an actual screen (no
+  device/emulator used this pass — still a gap, same as Phase 1).
+- **`PetAnimatorGoldenTest.kt`** (new, `src/test/`, plain JVM unit test —
+  NOT instrumented/androidTest, so it runs via `./gradlew
+  testDebugUnitTest` with no emulator) replays the identical scripted
+  sequence and diffs all 18 `Pose` fields per frame against the fixture,
+  tolerance `EPS=0.02` (not bit-exact — Python libm vs JVM `Math` can
+  differ in the last ULP or two for sin/cos/exp, which would compound
+  over 710 frames of iterative integration otherwise). **Passes: 1/1,
+  0 failures**, confirmed via a forced re-run (not just Gradle's
+  up-to-date cache). Added `testImplementation("org.json:json:20240303")`
+  to `app/build.gradle.kts` — deliberately the plain-JVM org.json
+  artifact, not Android's SDK stub (which throws
+  `UnsupportedOperationException` for unit tests without Robolectric).
+- **`PetView.kt`** rewritten: owns a real `PetAnimator` + `BlobRenderer`
+  (renamed the Phase-1 `VIEW_SIZE_DP` placeholder constant to
+  `VIEW_SIZE_PX` — it was never actually dp-scaled, just a raw pixel
+  size, and it must exactly match `OverlayService`'s `WindowManager`
+  window size or the renderer draws into a coordinate space smaller than
+  the actual canvas; `OverlayService.PET_SIZE_PX` now reads
+  `PetView.VIEW_SIZE_PX` instead of its own separate magic-number
+  literal, so they can't drift apart again), driven by a
+  `Choreographer.FrameCallback` loop (`doFrame` computes real dt from
+  frame timestamps, calls `animator.update()`, stores the resulting
+  `Pose`, calls `invalidate()`; `onDraw` just paints the last-computed
+  `Pose` — deliberately NOT re-running `update()` inside `onDraw`).
+  Touch handling now drives the animator directly: tap→`triggerHop`,
+  long-press→`triggerWave`, fling→`triggerGiggle`, drag-start/end→
+  `startDrag()`/`endDrag()` (which was already a no-op placeholder
+  before, now visibly squashes/deforms while being dragged). New
+  `applyEngineSnapshot(emotion, action, sleeping)` is what
+  `OverlayService`'s tick loop calls (see below).
+  **Known deliberate gap, documented in the class doc comment**: the
+  animator's own `x`/`y`/wander simulation is NOT wired to the real
+  `WindowManager` window position — `wanderRange` is set to `(1e6, 1e6)`
+  so it never picks autonomous glide targets, because
+  `OverlayService.onDragBy` is the only thing that currently moves the
+  real window, and letting the animator's internal position simulation
+  run free would silently diverge from where the window actually is
+  on-screen (pupil gaze-tracking math depends on `animator.x`/`y` matching
+  real position). Wiring autonomous cross-screen movement (reading
+  `animator.x`/`y` back into `WindowManager.LayoutParams` each frame) is
+  a clean, well-scoped follow-up — not done this pass.
+- **`OverlayService.kt`**: tick loop now parses `PetBridge.tick()`'s
+  returned `Snapshot` (already a Kotlin data class, no manual JSON
+  re-parsing needed) and posts `petView.applyEngineSnapshot(...)` onto
+  `uiHandler` (main thread — required, since it touches animator/view
+  state that `onDraw`/touch handlers also touch, and `PetAnimator` has no
+  internal synchronization of its own, matching Python's original which
+  is also only ever touched from Qt's single GUI thread on desktop).
+  `PET_SIZE_PX` companion constant removed in favor of reading
+  `PetView.VIEW_SIZE_PX` (see above).
+- Full verification chain, all green: `./gradlew assembleDebug
+  testDebugUnitTest` (APK packages + golden test passes in the same
+  invocation), Python `tests/` suite still 39/39 (this pass touched zero
+  Python files other than adding the new golden-fixture generator
+  script, which isn't part of `core/` or the test suite).
+- **Not done, still open**: no emulator/device run (visual correctness of
+  `BlobRenderer` is unverified beyond "compiles and doesn't crash the
+  Gradle package task"); animator-driven autonomous window movement (see
+  above); Phase 3's Settings UI / LLM key entry / persona config are
+  still entirely unwired (`PetBridge.init(filesDir.absolutePath, "{}")`
+  is still a hardcoded empty config in `OverlayService.onCreate`); Phase
+  4 (UsageStats/battery context sources) untouched; the in-app fallback
+  pet view for denied overlay permission (Phase 1 gap) is still open.
+  Next logical step per the plan is either finishing Phase 3 (Settings
+  UI + hosted-LLM key entry wired to `PetBridge.updateConfig`) or an
+  emulator smoke-test pass to actually eyeball the renderer/animator on
+  a screen for the first time.
+
+## Android Phase 3: Settings UI + hosted-LLM key entry (2026-07-17, same day)
+Continued straight from the previous entry's "next" pointer. Wired the
+config half of Phase 3 (`docs/android_plan.md` §5.5/§7 Phase 3); engine
+tick→animator wiring was already done in Phase 2.
+
+- **New `settings/PetSettingsStore.kt`** — the only place that reads/writes
+  the app-level pet config. Backed by `EncryptedSharedPreferences` (Android
+  Keystore, `androidx.security:security-crypto:1.1.0-alpha06` — new
+  dependency, justified directly by the plan's §5.4 requirement that API
+  keys never land in plaintext on-disk) rather than plain
+  `SharedPreferences`, since `llmApiKey` lives in the same store as
+  name/traits/prompt/frequency for simplicity (no sensitive-vs-not file
+  split needed). `PetSettings` data class + `toConfigJson()` produces the
+  exact JSON shape `core/bridge.py`'s `DEFAULT_PET_CONFIG` expects (name,
+  personality_traits as a real JSON array split from a comma-separated UI
+  field, initial_prompt, message_frequency, system_prompt, llm_provider,
+  llm_api_key, llm_model_override, llm_base_url).
+- **New `settings/SettingsActivity.kt` + `res/layout/activity_settings.xml`**
+  — plain Views + ViewBinding (matching `MainActivity`'s existing style,
+  deliberately NOT Jetpack Compose — the plan's §6 layout mentions Compose
+  but it's not worth a new UI toolkit for one form screen this early).
+  Spinners for message frequency (quiet/normal/chatty) and LLM provider
+  (ollama/openai/anthropic/openrouter, ids from new `llm_provider_ids`/
+  `llm_provider_labels` string-arrays mirroring `core/llm_providers.py`'s
+  `PROVIDER_LABELS`), password-masked API key field, model-override and
+  base-URL (hosted providers only — see gap note below) fields. On Save:
+  persists via `PetSettingsStore.save()` then `sendBroadcast(ACTION_CONFIG_UPDATED)`.
+- **`MainActivity`**: new "Settings" button (`activity_main.xml`) opens
+  `SettingsActivity`.
+- **`OverlayService`**: `onCreate` now calls
+  `PetBridge.init(filesDir.absolutePath, PetSettingsStore.currentConfigJson(this))`
+  instead of the Phase-1 hardcoded `"{}"`. `screenReceiver`'s existing
+  dynamic `IntentFilter` (already used for `ACTION_SCREEN_ON/OFF`) also now
+  listens for `PetSettingsStore.ACTION_CONFIG_UPDATED` → new
+  `reloadConfig()` calls `PetBridge.updateConfig(...)` on the worker
+  thread — so a Settings save while the overlay is running takes effect
+  immediately, no service restart, mirroring desktop's
+  `apply_runtime_settings()` "push on save" pattern.
+- Registered `.settings.SettingsActivity` in `AndroidManifest.xml`
+  (`exported="false"` — in-app only, no external launch surface).
+- Verified: `cd android && ./gradlew assembleDebug testDebugUnitTest` green
+  (golden test still 1/1, APK packages with the new Activity/dependency).
+  Python suite still 39/39 (untouched this pass — only `android/` files
+  changed). No emulator/device run — visual/UX correctness of the new
+  screen is unverified beyond "compiles and launches via the manifest
+  entry," same caveat as Phase 1/2's renderer.
+
+## LAN Ollama URL live-wiring (2026-07-17, same day, immediate follow-up)
+Closed the gap flagged above right after writing it. `core/pet_brain.py`:
+new `_effective_ollama_url()` returns `self.base_url or self.url` — the
+Ollama `_chat()` POST and `available()`'s `/api/tags` probe both now call
+it instead of reading `self.url` directly, so a live `set_provider(...,
+base_url=...)` call (already wired end-to-end from
+`core/bridge.py`→`PetBridge.updateConfig`→Android's Settings "Server URL"
+field) actually redirects Ollama traffic to a LAN address, not just hosted
+providers. `self.url` (constructor default, `OLLAMA_URL`) is the fallback
+when no override is set, so **desktop behavior is unchanged** — desktop's
+`default_config` never sets `llm_base_url` at all, so `base_url` stays
+`None` there regardless. Renamed the Android Settings string
+(`settings_base_url_label` → "Server URL override... hosted-provider
+endpoint override, or your LAN Ollama address") to reflect the fix instead
+of the earlier "hosted providers only" caveat.
+Verified: Python suite 39/39 (`tests/test_bridge.py`'s existing hosted-
+provider-with-no-key tests are unaffected — this only touches the Ollama
+branch), `./gradlew assembleDebug testDebugUnitTest` still green.
+Now fully closes plan §5.4 item 2 ("Ollama over LAN") for the config/
+wiring side; still no device test of an actual phone talking to a
+LAN Ollama instance (needs Ryan's own network to verify live).
+- Remaining open items per the plan: Phase 4 (UsageStats/battery event
+  sources), Phase 1's in-app fallback pet view for denied overlay
+  permission, first emulator/device smoke test of anything visual
+  (renderer, Settings screen, LAN Ollama round-trip). No commits made
+  anywhere.
+
+## Phase 1 gap closed: in-app fallback pet view (2026-07-17, same day)
+Immediate next item off the open list. `MainActivity` now has a "Use Pip
+in-app instead" toggle that embeds a real `PetView` (Phase 2's actual
+renderer/animator, same class the overlay uses) as a plain child view
+inside `activity_main.xml`'s new `petContainer` `FrameLayout` — no
+`WindowManager`/overlay permission needed at all, closing the plan's §5.1
+"fallback mode" gap that Phase 1 had explicitly left open.
+- **Mutual exclusivity, not two independent pets**: `core/bridge.py`'s
+  session is a module-level singleton in one embedded Python interpreter
+  per process — `OverlayService` and the in-app fallback share the SAME
+  underlying engine session if both tried to drive it, which would
+  double-tick/corrupt dt accounting. New `OverlayService.isRunning`
+  (companion `var`, set in `onCreate`/`onDestroy`) is checked before
+  `MainActivity` activates its fallback pet (Toast + refusal via
+  `in_app_pet_blocked_by_overlay` if the overlay is already up); the
+  overlay's own start button (`toggleServiceButton`) is disabled while the
+  fallback is active, and the fallback button is disabled while the
+  overlay service is running. Only one driver ticks the bridge at a time.
+- `MainActivity` gained its own `HandlerThread`/`Handler` (mirroring
+  `OverlayService`'s worker-thread pattern exactly) for `PetBridge.init`/
+  `tick`/`onInteraction`/`shutdown` calls, and a `uiHandler.postDelayed`
+  tick loop at the same `TICK_INTERVAL_MS` (2s) cadence. `setupInAppPet()`
+  creates the view + thread + calls `PetBridge.init` with
+  `PetSettingsStore.currentConfigJson(this)` (same config source Settings
+  writes to — the fallback pet picks up the same persona/LLM settings the
+  overlay would). `teardownInAppPet()` stops ticking, calls
+  `PetBridge.shutdown()` (flushes state, frees the session for
+  `OverlayService` to `init()` fresh later without stale state), quits the
+  thread, and is also called from `onDestroy()` (guarded to skip UI
+  mutation there since the view hierarchy may already be torn down).
+- `PetView.Listener.onDragBy` is a no-op for the in-app embed (nothing to
+  move — there's no separate window, and `PetView`'s own squash/drag pose
+  already reacts visually on touch); `onInteraction` still forwards to
+  `PetBridge.onInteraction` on the worker thread exactly like the overlay.
+- New strings: `use_pet_in_app`/`hide_in_app_pet` (button label toggle),
+  `in_app_pet_blocked_by_overlay` (Toast text).
+- Verified: `./gradlew assembleDebug testDebugUnitTest` green; Python
+  suite still 39/39 (zero Python files touched this pass). No emulator/
+  device run — same "compiles, wires correctly" caveat as every other
+  Android UI pass so far; the actual in-app pet has never been looked at
+  on a real screen.
+- Remaining open items per the plan: Phase 4 (UsageStats/battery event
+  sources), first emulator/device smoke test of literally anything visual
+  (renderer, Settings screen, in-app fallback, LAN Ollama round-trip). No
+  commits made anywhere.
+
+## Speech bubble + idle chatter + minimal Phase 4 UsageMonitor (2026-07-17, same day)
+Ryan asked for a review of the codebase against `docs/android_plan.md`.
+That review surfaced the actual highest-priority gap: **the Android app
+had zero AI commentary** — `PetBridge.onActivity()`/`idleComment()` were
+both defined but never called from any Kotlin code, and even if they had
+been, there was no UI to show `Snapshot.speech` (the plan's §3
+`SpeechBubbleView` was never built in the Phase-2 pass). It was a
+silent animated blob. Closed both gaps plus made a real start on Phase 4:
+
+- **New `overlay/SpeechBubbleView.kt`** — a plain styled `TextView`
+  (cream/lavender theme matching desktop's `SpeechBubble`), not a Canvas
+  paint routine — `show(text, handler, durationMs)` resets its own
+  auto-hide timer rather than stacking pending hides. Reused as-is in two
+  hosts: `OverlayService` (as a second floating overlay window) and
+  `MainActivity`'s in-app fallback (as a plain inline view in
+  `activity_main.xml`).
+- **`OverlayService`**: `addBubbleView()` creates a second
+  `TYPE_APPLICATION_OVERLAY` window (`FLAG_NOT_TOUCHABLE` added on top of
+  the pet window's own `FLAG_NOT_FOCUSABLE` so it never steals a touch),
+  positioned `BUBBLE_Y_OFFSET_PX` (150px) above the pet window and
+  repositioned in lockstep inside `onDragBy`. New `maybeTriggerIdleComment()`
+  (called from the existing 2s `tickRunnable`, gated by
+  `IDLE_COMMENT_INTERVAL_MS`=20s + a local probability roll from new
+  `settings/MessageFrequency.kt`, mirroring `core/bridge.py`'s
+  `MESSAGE_FREQUENCY_PRESETS.idle_prob`) calls `PetBridge.idleComment()`
+  and shows the bubble on a hit. Real pacing is still enforced
+  server-side by the engine's `minimumSpeechCooldown` (60s default) — the
+  local roll only controls how often an attempt is even made, so calling
+  it "too often" from Kotlin can't actually spam the user.
+- **Phase 4, minimal start — new `monitor/UsageMonitor.kt`**:
+  `hasPermission()` (checks the special `PACKAGE_USAGE_STATS` access via
+  `AppOpsManager`, no persistent granted-callback exists so it's
+  re-checked every use), `currentForegroundPackage()` (queries
+  `UsageStatsManager` events over the last 10s, returns the most recent
+  `MOVE_TO_FOREGROUND` package — `@Suppress("DEPRECATION")`'d
+  intentionally since the replacement `ACTIVITY_RESUMED` needs API 29+
+  and minSdk here is 26), `appLabel()` (resolves a display name via
+  `PackageManager`, matching the plan's "package + app label only, no
+  titles" reduced-context note). `OverlayService.maybeCheckForegroundApp()`
+  (piggybacked on the same tick loop, throttled to every 4s) is a no-op
+  entirely — not just gated — when the permission isn't granted, so this
+  costs nothing for users who never opt in. On a real foreground change
+  (and never for the app's own package), calls
+  `PetBridge.onActivity(label, null, pkg, "app switch")` — the first real
+  caller of that bridge function anywhere in the app — and shows any
+  resulting speech.
+- **`MainActivity`**: same `maybeTriggerIdleComment()` pattern wired into
+  `inAppTickRunnable`, showing into the new inline `inAppBubble` view.
+  Deliberately did NOT wire `UsageMonitor` into the in-app fallback (kept
+  it overlay-only) — the fallback is meant to be the lightweight "just the
+  pet, no permissions" path, mirroring how desktop's fuller monitor stack
+  only runs in the real `desktop_pet.py` process. New "Enable
+  activity-aware chatter" button (`enable_usage_access`/
+  `usage_access_enabled` strings) opens
+  `Settings.ACTION_USAGE_ACCESS_SETTINGS` directly — granting that special
+  access IS the opt-in (no separate app-level toggle), matching how
+  desktop's keystroke-commentary opt-in is a single checkbox.
+- Verified: `./gradlew assembleDebug testDebugUnitTest` green, zero
+  compiler warnings. Python suite still 39/39 (no Python files touched
+  this pass). No emulator/device run — same caveat as every prior Android
+  pass; the bubble's actual on-screen position/timing/legibility and the
+  UsageStats permission flow have never been looked at on a real screen.
+- Still open per the plan: battery/charging context sources (the other
+  half of Phase 4), Phase 5 hardening/release, and — cutting across
+  everything built so far — a first real emulator/device smoke test. No
+  commits made anywhere.
+
+## First real emulator smoke test — found and fixed 2 real bugs (2026-07-17, same day)
+Ryan asked to set up an emulator. This machine already had Android
+emulator + several pre-existing AVDs (`~/.android/avd/`, from unrelated
+Flutter work) plus working KVM (`vmx` present, user in `kvm` group,
+`emulator -accel-check` confirms usable) — launched the existing
+`pixel_6` AVD (API 34, x86_64, google_apis_playstore) windowed on the
+real `DISPLAY=:0` X session (visible to Ryan directly) and drove it via
+`adb`/`uiautomator dump`/`screencap` for my own verification. Granted
+`SYSTEM_ALERT_WINDOW`/`GET_USAGE_STATS` via `adb shell appops set` and
+`POST_NOTIFICATIONS` via `adb shell pm grant` to exercise the full flow
+without needing manual UI permission taps. **This is the first time
+anything in `android/` has ever run on a screen** — every prior "verified"
+claim in this file before today was compile/package/unit-test only.
+
+**Bug #1 — real crash, found immediately**: tapping "Let Pip out" crashed
+the whole app instantly. `OverlayService.onCreate()`'s
+`registerReceiver(screenReceiver, IntentFilter)` (2-arg form) throws
+`SecurityException` on API 33+: "One of RECEIVER_EXPORTED or
+RECEIVER_NOT_EXPORTED should be specified..." — this could never have
+been caught by compilation or the JVM unit test suite (Robolectric-free),
+only by actually running on an API-33+ target. Fixed: switched to
+`ContextCompat.registerReceiver(this, screenReceiver, filter,
+ContextCompat.RECEIVER_NOT_EXPORTED)` — correct choice since
+SCREEN_ON/OFF are system-protected broadcasts (only the OS can send them)
+and `PetSettingsStore.ACTION_CONFIG_UPDATED` is an internal same-app
+signal that should never be receivable from another app anyway.
+`ContextCompat` (not the raw 3-arg `Context.registerReceiver`, API
+33+-only) keeps this working down to minSdk 26. Verified: reinstalled,
+retapped, `OverlayService` created cleanly, `isForeground=true` in
+`dumpsys activity services`, zero FATAL in logcat.
+
+**First-ever live render confirmed**: with the crash fixed, the actual
+`BlobRenderer.kt`/`PetAnimator.kt` port rendered on a real screen for the
+first time — a small lavender antenna'd blob with eyes/smile/shadow,
+visually matching the desktop pet's design intent. Confirmed via
+`[PipEngine]` log lines (Python's `logging` module output IS captured by
+Chaquopy under the `python.stderr` logcat tag — plain `print()` is NOT
+captured, see gotcha below) showing `select_action` genuinely firing every
+~2s tick (`'excited'`, `'dance'`, `'somersault'`, `'eat'` — energy
+restore confirmed working end-to-end, `'wobble'`, `'wave'`) — the Python
+bridge is really alive inside the embedded interpreter, not just present.
+
+**Confirmed working**: pet survives `KEYCODE_HOME` (app-switch survival —
+one of Phase 1's stated exit criteria), "Put Pip away" cleanly removes
+both overlay windows (`dumpsys window windows` showed zero leftover
+`squishmate` overlay windows, only MainActivity's own), restarting the
+service afterward recreates them cleanly with no crash — the other two
+Phase-1 exit criteria. In-app fallback (`MainActivity`'s embedded
+`PetView`) also confirmed working end-to-end: mutual exclusivity buttons
+correctly gray out, and the pet renders full-size and clearly inline in
+the activity layout (a much better/clearer view of the renderer than the
+tiny overlay corner) with zero crash.
+
+**Bug #2 — real visual bug, found via idle chatter actually firing**:
+after going to the home screen and waiting, the periodic idle-comment
+wiring fired for real — a genuine speech bubble appeared reading "Brain's
+a little..." (a `SAFE_FALLBACKS` line, expected since no LLM provider key
+is configured on this test install) — but it was clipped off the right
+edge of the screen, unreadable past a few words. Root cause:
+`OverlayService.showBubble()`/`onDragBy()` set the bubble window's `x` to
+exactly match the pet window's `x` with zero bounds checking, so a pet
+positioned anywhere in the right portion of the screen pushes the
+(`WRAP_CONTENT`, up to `maxWidth`=260dp) bubble partially or fully
+off-screen. Fixed: new `clampBubbleX(petX)` coerces the bubble's x into
+`[0, screenWidthPx - bubbleView.maxWidth]`, used in `addBubbleView()`,
+`showBubble()`, and `onDragBy()`'s bubble-reposition branch alike.
+Rebuilt/reinstalled and confirmed via `dumpsys window windows` that a
+fresh service start still places the pet at the exact coded (100,300)
+default (ruling out an initial-placement bug) — did NOT get a second
+live repro of a clipped-vs-fixed bubble side by side (synthetic
+`adb shell input swipe` drags were unreliable in this environment, never
+visibly moved the pet window despite several attempts/durations — a
+tooling limitation, not evidence of a drag-code bug: a plain tap directly
+on the pet reliably produces zero position change as correctly designed,
+confirming the drag-slop guard itself isn't over-triggering). The fix
+itself is a straightforward, obviously-correct `coerceIn` bounds clamp;
+confidence is high without a second on-device repro.
+
+**Debugging gotcha for future agents**: Chaquopy captures Python's
+`logging` module output (writes to `sys.stderr`) under logcat tag
+`python.stderr`, but plain `print()` calls (`sys.stdout`, block-buffered
+when not a TTY) do NOT reliably show up — zero `python.stdout` lines
+appeared all session despite `pet_brain.py` using `print()` extensively
+for its `[pet_brain] _chat: ...` debug trail. **Do not rely on
+`pet_brain.py`'s prints for on-device debugging** — either grep
+`python.stderr` for `logging`-based output only, or (better, not done
+this pass) switch `pet_brain.py`'s debug trail to the `logging` module to
+match `pet_engine.py`'s already-working pattern.
+
+**Still true/unverified**: LAN Ollama round-trip (no real Ollama host
+reachable from this emulator instance), Settings screen UI (not opened
+this pass), a real drag-to-move interaction (see swipe-tooling caveat
+above), battery/OEM-killer behavior, and everything Phase 4/5 still
+lists as open. Emulator (`pixel_6`, AVD) is left **running** — Ryan can
+keep poking at it directly on `:0`, or ask to tear it down.
+
+## Continued integration testing session (2026-07-17, same day) — Settings
+verified, `pet_brain.py` switched to `logging`
+Ryan confirmed real manual drag-to-move works fine on-device (the earlier
+`adb shell input swipe` unreliability was a synthetic-input tooling
+limitation in this sandbox, not a code bug — a plain tap directly on the
+pet reliably produces zero position drift, confirming the drag-slop guard
+itself is sound). Continued the on-device pass:
+
+- **Settings screen fully exercised for the first time**: opened from
+  MainActivity, all fields render correctly (Name pre-filled "Pip",
+  frequency/provider spinners pre-selected to their stored values,
+  System-prompt/API-key/model-override/server-URL fields all visible,
+  `ScrollView` works). Opened the message-frequency spinner (all 3 options
+  render), selected "Chatty", hit Save — confirmed via `topResumedActivity`
+  returning to `MainActivity` (no crash) and, on reopening Settings, the
+  value round-tripped correctly through `EncryptedSharedPreferences`
+  (still "Chatty") — **first real confirmation the Keystore-backed storage
+  works on an actual device/emulator**, not just "doesn't throw in a unit
+  test." Bumping to "Chatty" also visibly increased idle-chatter
+  frequency: a real speech bubble ("Boop! Doing my little pet things.")
+  appeared moments after reopening Settings, on-screen and fully
+  readable (confirming the earlier bubble-clamp fix holds).
+- **Tooling note for future agents**: `uiautomator dump` (pulled via `adb
+  pull /sdcard/*.xml`) + regex-extracting `bounds="[...]"` per
+  `resource-id` is a far more reliable way to compute tap coordinates for
+  `adb shell input tap` than eyeballing screenshot pixel positions —
+  several early taps in this session missed their target button/spinner
+  item because I computed coordinates from a scaled-down screenshot
+  preview instead of the raw 1080x2400 device bounds. Always dump-and-tap,
+  not screenshot-and-guess.
+- **`core/pet_brain.py` switched from `print()` to `logging`** (new
+  module-level `logger = logging.getLogger("PetBrain")`, mirrors
+  `pet_engine.py`'s existing `PipEngine` logger setup exactly, format
+  `"[pet_brain] %(message)s"`) — closes the debugging gotcha flagged in
+  the previous smoke-test entry. Every prior `print(f"[pet_brain] ...")`
+  call site converted to `logger.info(...)`/`logger.warning(...)` with the
+  redundant `[pet_brain]` prefix stripped from the message (the formatter
+  now adds it). Verified: `.venv/bin/python -m unittest discover -s
+  tests` still 39/39, and the live-Ollama test's captured output shows
+  byte-for-byte the same `[pet_brain] _chat: ...`/`think: ...` line shapes
+  as before, just now actually flush-guaranteed. **Rebuilt and reinstalled
+  on the emulator to confirm this doesn't break Chaquopy packaging** —
+  clean install, service starts fine. Could NOT get a live on-device
+  confirmation of the new logger lines specifically, though — traced this
+  to `PetBrain.available()` correctly returning `False` on this sandbox
+  (no Ollama reachable, localhost or LAN), so `core/bridge.py`'s
+  `_speak_or_fallback` short-circuits straight to `random.choice
+  (SAFE_FALLBACKS)` and never calls `_chat()`/hits any `pet_brain.py`
+  logging call at all — this is correct, expected behavior (not a bug),
+  just means the logging fix's on-device visibility is unverified here by
+  construction. The desktop `.venv` test run against real local Ollama
+  already exercises and confirms the exact same code path/format, so
+  confidence is still high.
+- All builds/tests green: `./gradlew assembleDebug testDebugUnitTest`,
+  Python suite 39/39. Emulator still running, Chatty frequency + earlier
+  test settings persisted in its app-private storage.

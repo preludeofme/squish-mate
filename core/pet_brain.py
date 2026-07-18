@@ -14,6 +14,7 @@ Runs all HTTP calls in background threads.
 import re
 import time
 import json
+import logging
 import threading
 import random
 from collections import deque
@@ -24,6 +25,21 @@ except ImportError:
     requests = None
 
 from core import llm_providers
+
+# Mirrors pet_engine.py's `logger`/`PipEngine` setup — moved off plain
+# `print()` because embedded hosts (Chaquopy on Android) only capture
+# Python's `logging` output (routed to stderr) in their native log
+# viewer; a bare `print()` to stdout is silently lost there (block-buffered
+# and never flushed, confirmed via a real device/emulator run — see
+# active-context.md's Android emulator smoke-test entry). Desktop's
+# console output is unaffected: `logging`'s default StreamHandler still
+# goes to stderr, same visible terminal either way.
+logger = logging.getLogger("PetBrain")
+logger.setLevel(logging.INFO)
+logger.handlers = []
+_ch = logging.StreamHandler()
+_ch.setFormatter(logging.Formatter("[pet_brain] %(message)s"))
+logger.addHandler(_ch)
 
 MODEL_NAME = "gemma4:e4b"
 OLLAMA_URL = "http://localhost:11434"
@@ -139,6 +155,14 @@ class PetBrain:
                 return cfg.get("options", {}), cfg.get("keepAlive", "2m")
         return {}, "5m"
 
+    def _effective_ollama_url(self):
+        """Ollama server base URL, honoring a live `base_url` override
+        (e.g. Android's "LAN Ollama" Settings field — see
+        docs/android_plan.md §5.4 item 2) over the constructor default.
+        `self.url` stays the fallback so desktop's local-Ollama behavior
+        (no override configured) is unchanged."""
+        return (self.base_url or self.url).rstrip("/")
+
     def _effective_timeout(self):
         """Response-time budget for a single call. Prefers the engine's
         `llmTimeout` config (user/settings-controlled, also what
@@ -193,10 +217,10 @@ class PetBrain:
     def _chat(self, system, user, num_predict=200, temperature=0.75,
               image_b64=None, max_retries=1, log_prompt=True):
         if self.model == "engine_only":
-            print("[pet_brain] _chat: skipped — model set to 'engine_only'")
+            logger.info("_chat: skipped — model set to 'engine_only'")
             return None
         if requests is None:
-            print("[pet_brain] _chat: skipped — 'requests' package not available")
+            logger.info("_chat: skipped — 'requests' package not available")
             return None
 
         if self.provider != "ollama":
@@ -205,10 +229,11 @@ class PetBrain:
         effective_timeout = self._effective_timeout()
         for attempt in range(max_retries + 1):
             try:
-                print(
-                    f"[pet_brain] _chat: calling Ollama model='{self.model}' "
-                    f"(attempt {attempt + 1}/{max_retries + 1}, num_predict={num_predict}, "
-                    f"timeout={effective_timeout}s) user='{user[:120]}'"
+                logger.info(
+                    "_chat: calling Ollama model='%s' (attempt %d/%d, num_predict=%s, "
+                    "timeout=%ss) user='%s'",
+                    self.model, attempt + 1, max_retries + 1, num_predict,
+                    effective_timeout, user[:120],
                 )
                 user_message = {"role": "user", "content": user}
                 if image_b64:
@@ -242,7 +267,7 @@ class PetBrain:
                     req_options.update(mode_opts)
                 
                 r = requests.post(
-                    f"{self.url}/api/chat",
+                    f"{self._effective_ollama_url()}/api/chat",
                     json={
                         "model": self.model,
                         "messages": [
@@ -265,15 +290,15 @@ class PetBrain:
                 data = r.json()
                 content = (data.get("message") or {}).get("content", "")
                 if content:
-                    print(f"[pet_brain] _chat: received {len(content)} chars: {content[:200]!r}")
+                    logger.info("_chat: received %d chars: %r", len(content), content[:200])
                     return content
-                print(
-                    f"[pet_brain] _chat: empty content in response "
-                    f"(done_reason={data.get('done_reason')!r}) — model likely spent its "
-                    f"num_predict budget without producing output"
+                logger.warning(
+                    "_chat: empty content in response (done_reason=%r) — model likely "
+                    "spent its num_predict budget without producing output",
+                    data.get("done_reason"),
                 )
             except Exception as e:
-                print(f"[pet_brain] _chat: ollama call FAILED: {e}")
+                logger.warning("_chat: ollama call FAILED: %s", e)
                 return None
         return None
 
@@ -284,10 +309,9 @@ class PetBrain:
         any failure, and PetBrain callers already treat None as
         'use a SAFE_FALLBACKS line'."""
         effective_timeout = self._effective_timeout()
-        print(
-            f"[pet_brain] _chat: calling {self.provider} model='{self.model}' "
-            f"(num_predict={num_predict}, timeout={effective_timeout}s) "
-            f"user='{user[:120]}'"
+        logger.info(
+            "_chat: calling %s model='%s' (num_predict=%s, timeout=%ss) user='%s'",
+            self.provider, self.model, num_predict, effective_timeout, user[:120],
         )
         try:
             content = llm_providers.chat(
@@ -297,13 +321,13 @@ class PetBrain:
                 image_b64=image_b64, timeout=effective_timeout,
             )
         except llm_providers.ProviderError as e:
-            print(f"[pet_brain] _chat: {self.provider} call FAILED: {e}")
+            logger.warning("_chat: %s call FAILED: %s", self.provider, e)
             return None
         if content:
-            print(f"[pet_brain] _chat: received {len(content)} chars from "
-                  f"{self.provider}: {content[:200]!r}")
+            logger.info("_chat: received %d chars from %s: %r",
+                        len(content), self.provider, content[:200])
             return content
-        print(f"[pet_brain] _chat: empty content from {self.provider}")
+        logger.warning("_chat: empty content from %s", self.provider)
         return None
 
     def available(self):
@@ -314,7 +338,7 @@ class PetBrain:
         if requests is None:
             return False
         try:
-            r = requests.get(f"{self.url}/api/tags", timeout=3)
+            r = requests.get(f"{self._effective_ollama_url()}/api/tags", timeout=3)
             return r.status_code == 200
         except Exception:
             return False
@@ -326,7 +350,7 @@ class PetBrain:
     def think(self, context, force=False, screenshot_b64=None):
         with self._lock:
             if not force and self._cooling_down():
-                print(f"[pet_brain] think: skipped — brain cooldown active ({self.cooldown}s)")
+                logger.info("think: skipped — brain cooldown active (%ss)", self.cooldown)
                 return None
             self._last_call = time.time()
 
@@ -371,18 +395,18 @@ class PetBrain:
 
         if not validated:
             fallback = random.choice(SAFE_FALLBACKS)
-            print(f"[pet_brain] think: using SAFE_FALLBACKS (raw={raw!r}) -> {fallback['text']!r}")
+            logger.info("think: using SAFE_FALLBACKS (raw=%r) -> %r", raw, fallback["text"])
             self._remember_line(fallback["text"])
             return fallback
 
-        print(f"[pet_brain] think: using LLM response -> {validated['text']!r}")
+        logger.info("think: using LLM response -> %r", validated["text"])
         self._remember_line(validated["text"])
         return validated
 
     def idle_comment(self, force=False):
         with self._lock:
             if not force and self._cooling_down():
-                print(f"[pet_brain] idle_comment: skipped — brain cooldown active ({self.cooldown}s)")
+                logger.info("idle_comment: skipped — brain cooldown active (%ss)", self.cooldown)
                 return None
             self._last_call = time.time()
 
@@ -403,15 +427,15 @@ class PetBrain:
         if raw and self.engine:
             validated = self.engine.validate_llm_response(raw)
             if not validated:
-                print(f"[pet_brain] idle_comment: LLM raw response failed validation: {raw!r}")
+                logger.info("idle_comment: LLM raw response failed validation: %r", raw)
 
         if not validated:
             fallback = random.choice(SAFE_FALLBACKS)
-            print(f"[pet_brain] idle_comment: using SAFE_FALLBACKS -> {fallback['text']!r}")
+            logger.info("idle_comment: using SAFE_FALLBACKS -> %r", fallback["text"])
             self._remember_line(fallback["text"])
             return fallback
 
-        print(f"[pet_brain] idle_comment: using LLM response -> {validated['text']!r}")
+        logger.info("idle_comment: using LLM response -> %r", validated["text"])
         self._remember_line(validated["text"])
         return validated
 
@@ -421,7 +445,7 @@ class PetBrain:
             return None
         with self._lock:
             if not force and self._cooling_down():
-                print(f"[pet_brain] comment_on_typing: skipped — brain cooldown active ({self.cooldown}s)")
+                logger.info("comment_on_typing: skipped — brain cooldown active (%ss)", self.cooldown)
                 return None
             self._last_call = time.time()
 
@@ -437,15 +461,15 @@ class PetBrain:
         if raw and self.engine:
             validated = self.engine.validate_llm_response(raw)
             if not validated:
-                print(f"[pet_brain] comment_on_typing: LLM raw response failed validation: {raw!r}")
+                logger.info("comment_on_typing: LLM raw response failed validation: %r", raw)
 
         if not validated:
             fallback = random.choice(SAFE_FALLBACKS)
-            print(f"[pet_brain] comment_on_typing: using SAFE_FALLBACKS -> {fallback['text']!r}")
+            logger.info("comment_on_typing: using SAFE_FALLBACKS -> %r", fallback["text"])
             self._remember_line(fallback["text"])
             return fallback
 
-        print(f"[pet_brain] comment_on_typing: using LLM response -> {validated['text']!r}")
+        logger.info("comment_on_typing: using LLM response -> %r", validated["text"])
         self._remember_line(validated["text"])
         return validated
 

@@ -1,9 +1,9 @@
 {
   "name": "Pip",
-  "color": "#6B7FE3",
-  "pet_species": "nocturne",
-  "pattern": "stars",
-  "shape": "horned",
+  "color": "#D9E36B",
+  "pet_species": "honeydew",
+  "pattern": "plain",
+  "shape": "round",
   "personality_traits": [
     "comedic and curious"
   ],

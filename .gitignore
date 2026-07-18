@@ -1,3 +1,12 @@
 .venv
 **/__pycache__/
 **/__pycache__/*
+
+# setuptools/pip build artifacts from packaging core/ as squish-mate-core
+# (see core/pyproject.toml) — produced e.g. when Chaquopy pip-installs
+# core/ as a local path dependency from android/.
+core/build/
+*.egg-info/
+
+# Android app (android/) has its own nested .gitignore for Gradle/Chaquopy
+# build outputs and local machine config.
