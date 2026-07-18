@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.SquishMate" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/pip_lavender_dark</item>
+        <item name="colorPrimaryVariant">@color/pip_lavender</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="android:statusBarColor" tools:targetApi="l">?attr/colorPrimaryVariant</item>
+    </style>
+</resources>

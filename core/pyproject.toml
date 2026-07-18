@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "squish-mate-core"
+version = "0.1.0"
+description = "Squish-Mate's pure-Python behavior engine (pet_engine, pet_brain, pet_memory, pet_library, pet_performance, llm_providers) plus the core.bridge JSON facade for embedding into non-desktop hosts. See ../docs/android_plan.md."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Buck" }]
+# Deliberately minimal — this is the embeddable slice of the repo (see
+# docs/android_plan.md Phase 0). psutil is optional at runtime (guarded by
+# try/except in pet_performance.py) and intentionally NOT declared here:
+# it doesn't build on Android/Chaquopy, and the engine already degrades
+# gracefully without it.
+dependencies = ["requests>=2.28"]
+
+[project.urls]
+Repository = "https://github.com/preludeofme/squish-mate"
+
+# This pyproject.toml deliberately lives IN core/ (not at the repo root)
+# so a local-path `pip install` (see android/app/build.gradle.kts's
+# Chaquopy `pip { install("../../core") }`) only ever reads this
+# directory's own files — never the sibling android/ Gradle project's
+# build-output tree, which would otherwise create a nested
+# input/output-directory conflict for Gradle (an installed source dir
+# that's an ancestor of the very build outputs consuming it).
+# `package_dir` maps the "core" package's root to "." (this directory),
+# so the built wheel still exposes it as `import core...` — identical to
+# how it's imported everywhere else in this repo.
+[tool.setuptools]
+packages = ["core"]
+
+[tool.setuptools.package-dir]
+core = "."

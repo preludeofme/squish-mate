@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Placeholder blob silhouette — a real port of ui/blob_renderer.py's
+     _body_path Bézier outline lands in Phase 2 (see docs/android_plan.md
+     §5.2/§7). This is deliberately a simple rounded shape for now so the
+     app has a recognizable, on-brand launcher icon before that port. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,24
+            C74,24 86,40 86,58
+            C86,76 72,86 54,86
+            C36,86 22,76 22,58
+            C22,40 34,24 54,24 Z" />
+    <path
+        android:fillColor="#8F6FC2"
+        android:pathData="M44,54 a5,6 0,1 0,0.1 0 Z" />
+    <path
+        android:fillColor="#8F6FC2"
+        android:pathData="M64,54 a5,6 0,1 0,0.1 0 Z" />
+</vector>

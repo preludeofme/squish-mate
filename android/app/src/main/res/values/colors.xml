@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches desktop Pip's default lavender (see pet_config.json's
+         "color": "#C9A5F0"). -->
+    <color name="pip_lavender">#C9A5F0</color>
+    <color name="pip_lavender_dark">#8F6FC2</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="black">#FF000000</color>
+</resources>
