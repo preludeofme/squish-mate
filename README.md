@@ -1,6 +1,14 @@
 # Squish-Mate
 
+<p align="center">
+  <img src="docs/images/banner.png" alt="Squish-Mate Banner" width="800">
+</p>
+
 A lightweight, cross-platform desktop pet (Squish-Mate) that monitors your activities and interacts with speech bubbles.
+
+<p align="center">
+  <img src="docs/images/desktop_preview.png" alt="Squish-Mate Desktop Preview" width="650">
+</p>
 
 ## Features
 
@@ -88,6 +96,12 @@ The pet will create a `pet_config.json` file with settings:
 - Message delays and limits
 
 ## Customization
+
+Squish-Mate is highly customizable. You can switch between different body shapes (like round, tall, wide, teardrop, chubby, or horned), decorative patterns (like spots, stripes, stars, or plain), custom base colors, and reactive emotional behaviors.
+
+<p align="center">
+  <img src="docs/images/customization_grid.png" alt="Squish-Mate Customization Options" width="650">
+</p>
 
 You can modify the fallback responses by editing `ui/pet_responses.py`, or configure the LLM prompt/traits via the Settings menu or `pet_config.json`.
 

@@ -101,6 +101,12 @@ dependencies {
     // screen's stored LLM API key (docs/android_plan.md §5.5 — "never
     // written to pet_config.json on-disk in plain text on device").
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // On-device LLM inference (docs/android_plan.md §5.4 item 3, "mediapipe"
+    // provider) — runs a local Gemma .task/LiteRT model entirely on-device,
+    // no network required. Only the inference RUNTIME is a normal Gradle
+    // dependency; the multi-GB model weights themselves are never bundled
+    // in the APK (Gemma license + size) — see llm/OnDeviceModel.kt.
+    implementation("com.google.mediapipe:tasks-genai:0.10.35")
     testImplementation("junit:junit:4.13.2")
     // Plain-JVM org.json (NOT the Android SDK stub, which throws in unit
     // tests) — used only by PetAnimatorGoldenTest to read the golden
